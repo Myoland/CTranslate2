@@ -51,6 +51,106 @@ TEST_P(PrimitiveTest, PenalizePreviousTokens) {
   expect_storage_eq(scores, expected);
 }
 
+#ifdef CT2_WITH_SYCL
+TEST(SYCLFloat16GemmTest, PreservesBetaAndBatchStrides) {
+  if (get_device_count(Device::SYCL) == 0
+      || !mayiuse_float16(Device::SYCL))
+    GTEST_SKIP() << "No FP16-capable SYCL device is available";
+
+  const StorageView broadcast_a = StorageView(
+    {2, 3},
+    std::vector<float>{1, 2, 3,
+                       4, 5, 6},
+    Device::SYCL).to(DataType::FLOAT16);
+  const StorageView strided_a = StorageView(
+    {2, 2, 3},
+    std::vector<float>{1, 2, 3,
+                       4, 5, 6,
+                       1, 2, 3,
+                       4, 5, 6},
+    Device::SYCL).to(DataType::FLOAT16);
+  const StorageView b = StorageView(
+    {2, 3, 2},
+    std::vector<float>{1, 0,
+                       0, 1,
+                       1, 1,
+                       2, 1,
+                       1, 0,
+                       0, 1},
+    Device::SYCL).to(DataType::FLOAT16);
+  const StorageView initial_c = StorageView(
+    {2, 2, 2},
+    std::vector<float>{0.5f, -0.5f,
+                       1.f, -1.f,
+                       -0.25f, 0.25f,
+                       2.f, -2.f},
+    Device::SYCL).to(DataType::FLOAT16);
+  const StorageView expected(
+    {2, 2, 2},
+    std::vector<float>{4.25f, 4.75f,
+                       10.5f, 10.5f,
+                       3.875f, 4.125f,
+                       14.f, 9.f});
+
+  for (const bool broadcast : {false, true}) {
+    StorageView c = initial_c;
+    const auto& a = broadcast ? broadcast_a : strided_a;
+    primitives<Device::SYCL>::gemm_batch_strided(
+      /*transpose_a=*/false,
+      /*transpose_b=*/false,
+      /*m=*/2,
+      /*n=*/2,
+      /*k=*/3,
+      /*alpha=*/1.f,
+      a.data<float16_t>(),
+      /*lda=*/3,
+      /*stridea=*/broadcast ? 0 : 6,
+      b.data<float16_t>(),
+      /*ldb=*/2,
+      /*strideb=*/6,
+      /*beta=*/0.5f,
+      c.data<float16_t>(),
+      /*ldc=*/2,
+      /*stridec=*/4,
+      /*batch_size=*/2);
+    expect_storage_eq(c.to_float32(), expected, 1e-3f);
+  }
+}
+
+TEST(SYCLFloat16GemmTest, KeepsFP32ScalingForNonRepresentableAlpha) {
+  if (get_device_count(Device::SYCL) == 0
+      || !mayiuse_float16(Device::SYCL))
+    GTEST_SKIP() << "No FP16-capable SYCL device is available";
+
+  const StorageView a = StorageView(
+    {1, 1}, std::vector<float>{0.5f}, Device::SYCL).to(DataType::FLOAT16);
+  const StorageView b = StorageView(
+    {1, 1}, std::vector<float>{1.5f}, Device::SYCL).to(DataType::FLOAT16);
+  StorageView c({1, 1}, DataType::FLOAT16, Device::SYCL);
+  primitives<Device::SYCL>::gemm(
+    /*a_is_packed=*/false,
+    /*b_is_packed=*/false,
+    /*transpose_a=*/false,
+    /*transpose_b=*/false,
+    /*m=*/1,
+    /*n=*/1,
+    /*k=*/1,
+    /*alpha=*/0.1f,
+    a.data<float16_t>(),
+    /*lda=*/1,
+    b.data<float16_t>(),
+    /*ldb=*/1,
+    /*beta=*/0.f,
+    c.data<float16_t>(),
+    /*ldc=*/1);
+
+  // FP32 alpha produces 0.07501220703125 after the final FP16 rounding.
+  // Rounding alpha to FP16 first would instead produce 0.074951171875.
+  const StorageView expected({1, 1}, std::vector<float>{0.07501220703125f});
+  expect_storage_eq(c.to_float32(), expected);
+}
+#endif
+
 INSTANTIATE_TEST_SUITE_P(CPU, PrimitiveTest, ::testing::Values(Device::CPU));
 #ifdef CT2_WITH_CUDA
 INSTANTIATE_TEST_SUITE_P(CUDA, PrimitiveTest, ::testing::Values(Device::CUDA));

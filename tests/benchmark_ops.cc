@@ -16,9 +16,9 @@ void benchmark_gather(Device device) {
   BENCHMARK(gather_op(data, input, output), 100000);
 }
 
-void benchmark_transpose(Device device) {
-  StorageView x({64, 48, 8, 64}, DataType::FLOAT32, device);
-  StorageView y(device);
+void benchmark_transpose(Device device, DataType dtype) {
+  StorageView x({64, 48, 8, 64}, dtype, device);
+  StorageView y(dtype, device);
   const ops::Transpose transpose_op({0, 2, 1, 3});
   BENCHMARK(transpose_op(x, y), 1000);
 }
@@ -84,7 +84,9 @@ void benchmark_topk(Device device) {
 }
 
 void benchmark_gemm(Device device, DataType dtype) {
-  DataType output_dtype = dtype != DataType::FLOAT32 ? DataType::INT32 : dtype;
+  DataType output_dtype = (dtype == DataType::INT8 || dtype == DataType::INT16)
+    ? DataType::INT32
+    : dtype;
   StorageView a({32 * 32, 512}, dtype, device);
   StorageView b({2048, 512}, dtype, device);
   StorageView c(output_dtype, device);
@@ -151,7 +153,7 @@ int main(int argc, char* argv[]) {
   if (op == "gather")
     benchmark_gather(device);
   else if (op == "transpose")
-    benchmark_transpose(device);
+    benchmark_transpose(device, dtype);
   else if (op == "split")
     benchmark_split(device);
   else if (op == "layer_norm")

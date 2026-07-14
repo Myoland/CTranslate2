@@ -465,7 +465,24 @@ namespace ctranslate2 {
         q = &queries_proj;
       }
 
-      _linear[0](*q, fused_proj);
+      bool split_projection = false;
+#ifdef CT2_WITH_SYCL
+      // In iterative MHA decoding, split Q/K/V before reshaping heads. The
+      // specialized Dense path combines its bias addition with this scatter.
+      // Padded, prefilling, GQA/MQA, quantized, and non-FP16 inputs retain the
+      // regular projection and split sequence.
+      if (_self_attention && !queries_padder && _num_heads_kv == _num_heads) {
+        // Keep the query output distinct from q: with pre-norm attention,
+        // queries_proj currently owns the normalized projection input.
+        StorageView split_queries_proj(dtype, device);
+        split_projection = _linear[0].project_and_split3(
+          *q, fused_proj, split_queries_proj, keys_proj, values_proj);
+        if (split_projection)
+          queries_proj = std::move(split_queries_proj);
+      }
+#endif
+      if (!split_projection)
+        _linear[0](*q, fused_proj);
 
       dim_t beam_size = 1;
 
@@ -511,8 +528,14 @@ namespace ctranslate2 {
           }
 
         } else {
-          split_heads(fused_proj, 3 * _num_heads, queries_padder);
-          ops::Split(1)(fused_proj, queries_proj, keys_proj, values_proj);
+          if (split_projection) {
+            split_heads(queries_proj, _num_heads);
+            split_heads(keys_proj, _num_heads);
+            split_heads(values_proj, _num_heads);
+          } else {
+            split_heads(fused_proj, 3 * _num_heads, queries_padder);
+            ops::Split(1)(fused_proj, queries_proj, keys_proj, values_proj);
+          }
 
           apply_qk_norm(queries_proj, keys_proj);
           apply_v_norm(values_proj);

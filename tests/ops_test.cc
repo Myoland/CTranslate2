@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstring>
 #include "test_utils.h"
 #include "ctranslate2/layers/attention.h"
 #include "ctranslate2/ops/ops.h"
@@ -117,6 +118,21 @@ TEST(OpTest, QuantizeINT16) {
   expect_storage_eq(output, expected);
   ops::Dequantize()(output, scale, reverse);
   expect_storage_eq(reverse, input);
+}
+
+TEST(OpTest, TopKHandlesEmptyDimensions) {
+  const StorageView empty_depth({2, 0}, DataType::FLOAT32, Device::CPU);
+  StorageView values(DataType::FLOAT32, Device::CPU);
+  StorageView indices(DataType::INT32, Device::CPU);
+  ops::TopK(0)(empty_depth, values, indices);
+  EXPECT_EQ(values.shape(), Shape({2, 0}));
+  EXPECT_EQ(indices.shape(), Shape({2, 0}));
+  EXPECT_THROW(ops::TopK(1)(empty_depth, values, indices), std::invalid_argument);
+
+  const StorageView empty_rows({0, 5}, DataType::FLOAT32, Device::CPU);
+  ops::TopK(2)(empty_rows, values, indices);
+  EXPECT_EQ(values.shape(), Shape({0, 2}));
+  EXPECT_EQ(indices.shape(), Shape({0, 2}));
 }
 
 class OpDeviceTest : public ::testing::TestWithParam<Device> {
@@ -321,6 +337,58 @@ TEST_P(OpDeviceTest, ConcatSplitDepth3) {
   expect_storage_eq(z, c);
 }
 
+#ifdef CT2_WITH_SYCL
+TEST(SYCLOpTest, FusedConcatSplitHandlesEmptySlices) {
+  if (get_device_count(Device::SYCL) == 0
+      || !mayiuse_float16(Device::SYCL))
+    GTEST_SKIP() << "No FP16-capable SYCL device is available.";
+
+  const StorageView empty({2, 0, 2}, DataType::FLOAT16, Device::SYCL);
+  const StorageView values_float(
+    {2, 3, 2},
+    std::vector<float>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+    Device::SYCL);
+  const StorageView values = values_float.to(DataType::FLOAT16);
+
+  // A leading empty input exercises the 2-input fused Concat branch without
+  // ever dereferencing the empty allocation.
+  StorageView concatenated(DataType::FLOAT16, Device::SYCL);
+  ops::Concat(1)({&empty, &values}, concatenated);
+  expect_storage_eq(concatenated, values);
+
+  // Exercise both fused Split arities, including an empty middle output.
+  StorageView first(DataType::FLOAT16, Device::SYCL);
+  StorageView second(DataType::FLOAT16, Device::SYCL);
+  ops::Split(1, {1, 2})(values, first, second);
+  const StorageView expected_first_float(
+    {2, 1, 2}, std::vector<float>{1, 2, 7, 8}, Device::SYCL);
+  const StorageView expected_second_float(
+    {2, 2, 2}, std::vector<float>{3, 4, 5, 6, 9, 10, 11, 12}, Device::SYCL);
+  expect_storage_eq(first, expected_first_float.to(DataType::FLOAT16));
+  expect_storage_eq(second, expected_second_float.to(DataType::FLOAT16));
+
+  StorageView prefix(DataType::FLOAT16, Device::SYCL);
+  StorageView middle(DataType::FLOAT16, Device::SYCL);
+  StorageView suffix(DataType::FLOAT16, Device::SYCL);
+  ops::Split(1, {1, 0, 2})(values, prefix, middle, suffix);
+  expect_storage_eq(prefix, expected_first_float.to(DataType::FLOAT16));
+  EXPECT_EQ(middle.size(), 0);
+  expect_storage_eq(suffix, expected_second_float.to(DataType::FLOAT16));
+
+  // All-zero shapes return before constructing a zero-size SYCL range.
+  StorageView empty_concat(DataType::FLOAT16, Device::SYCL);
+  ops::Concat(1)({&empty, &empty}, empty_concat);
+  EXPECT_EQ(empty_concat.size(), 0);
+  StorageView empty0(DataType::FLOAT16, Device::SYCL);
+  StorageView empty1(DataType::FLOAT16, Device::SYCL);
+  StorageView empty2(DataType::FLOAT16, Device::SYCL);
+  ops::Split(1, {0, 0, 0})(empty_concat, empty0, empty1, empty2);
+  EXPECT_EQ(empty0.size(), 0);
+  EXPECT_EQ(empty1.size(), 0);
+  EXPECT_EQ(empty2.size(), 0);
+}
+#endif
+
 TEST_P(OpDeviceTest, ConcatSplitDepthEqualParts) {
   Device device = GetParam();
   StorageView a({2, 2}, std::vector<float>{1, 2, 5, 6}, device);
@@ -512,6 +580,34 @@ TEST_P(OpDeviceTest, Transpose3DReverse) {
   StorageView y(x.dtype(), x.device());
   ops::Transpose()(x, y);
   expect_storage_eq(y, expected);
+}
+
+TEST_P(OpDeviceFPTest, Transpose4D) {
+  const Device device = GetParam().device;
+  const DataType dtype = GetParam().dtype;
+
+  const auto check = [=](const Shape& shape, const std::vector<dim_t>& perm) {
+    std::vector<float> values(static_cast<size_t>(compute_size(shape)));
+    for (size_t i = 0; i < values.size(); ++i)
+      values[i] = static_cast<float>(static_cast<int>(i % 251) - 125) / 16.f;
+
+    const StorageView input_cpu = StorageView(shape, values).to(dtype);
+    StorageView expected(dtype, Device::CPU);
+    const ops::Transpose transpose_op(perm);
+    transpose_op(input_cpu, expected);
+
+    const StorageView input = input_cpu.to(device);
+    StorageView output(dtype, device);
+    transpose_op(input, output);
+    expect_storage_eq(output, expected);
+  };
+
+  // The first shape uses 16-byte row copies for all floating-point types. The
+  // second takes the scalar 0213 path because the innermost row has a tail.
+  check({2, 3, 5, 64}, {0, 2, 1, 3});
+  check({2, 3, 5, 7}, {0, 2, 1, 3});
+  // Keep a non-attention permutation covered by the generic kernel.
+  check({2, 3, 5, 7}, {2, 0, 3, 1});
 }
 
 static const StorageView gemm_a({4, 5}, std::vector<float>{
@@ -811,6 +907,65 @@ TEST(SYCLTopKTest, SelectsAllNaNsWithoutOutOfBoundsAccess) {
   const StorageView values_cpu = values.to(Device::CPU);
   for (dim_t i = 0; i < values_cpu.size(); ++i)
     EXPECT_TRUE(std::isnan(values_cpu.data<float>()[i]));
+}
+
+TEST(SYCLTopKTest, OrdersTiesAndNaNsAcrossWorkGroups) {
+  if (get_device_count(Device::SYCL) == 0)
+    GTEST_SKIP() << "No SYCL device is available.";
+
+  constexpr dim_t depth = 4097;
+  constexpr dim_t k = 10;
+  const float inf = std::numeric_limits<float>::infinity();
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  std::vector<float> input_values(depth, nan);
+  input_values[4096] = inf;
+  input_values[2048] = inf;
+  input_values[3072] = 7.f;
+  input_values[5] = 7.f;
+  input_values[1025] = -inf;
+  input_values[257] = -inf;
+
+  const StorageView input({1, depth}, input_values, Device::SYCL);
+  const StorageView expected_indices(
+    {1, k},
+    std::vector<int32_t>{2048, 4096, 5, 3072, 257, 1025, 0, 1, 2, 3});
+  StorageView values(DataType::FLOAT32, Device::SYCL);
+  StorageView indices(DataType::INT32, Device::SYCL);
+
+  const ops::TopK op{k};
+  op(input, values, indices);
+
+  expect_storage_eq(indices, expected_indices);
+  const StorageView values_cpu = values.to(Device::CPU);
+  const float* selected_values = values_cpu.data<float>();
+  EXPECT_EQ(selected_values[0], inf);
+  EXPECT_EQ(selected_values[1], inf);
+  EXPECT_EQ(selected_values[2], 7.f);
+  EXPECT_EQ(selected_values[3], 7.f);
+  EXPECT_EQ(selected_values[4], -inf);
+  EXPECT_EQ(selected_values[5], -inf);
+  for (dim_t i = 6; i < k; ++i)
+    EXPECT_TRUE(std::isnan(selected_values[i]));
+
+  for (const DataType dtype : {DataType::FLOAT16, DataType::BFLOAT16}) {
+    if ((dtype == DataType::FLOAT16 && !mayiuse_float16(Device::SYCL))
+        || (dtype == DataType::BFLOAT16 && !mayiuse_bfloat16(Device::SYCL)))
+      continue;
+    const StorageView typed_input = input.to(dtype);
+    StorageView typed_values(dtype, Device::SYCL);
+    StorageView typed_indices(DataType::INT32, Device::SYCL);
+    op(typed_input, typed_values, typed_indices);
+    expect_storage_eq(typed_indices, expected_indices);
+  }
+
+  const StorageView expected_indices_k7(
+    {1, 7},
+    std::vector<int32_t>{2048, 4096, 5, 3072, 257, 1025, 0});
+  StorageView values_k7(DataType::FLOAT32, Device::SYCL);
+  StorageView indices_k7(DataType::INT32, Device::SYCL);
+  const ops::TopK op_k7{7};
+  op_k7(input, values_k7, indices_k7);
+  expect_storage_eq(indices_k7, expected_indices_k7);
 }
 
 TEST(SYCLRandomTest, PreservesEachDeviceSequenceWhenSwitchingDevices) {
@@ -1534,6 +1689,126 @@ static const StorageView bias_value({2, 2, 2}, std::vector<float>{
     -1.301039, 0.617229, -0.864480, 1.266894});
 static const StorageView bias_bias({2}, std::vector<float>{
     -0.099073, 0.898503});
+
+#ifdef CT2_WITH_SYCL
+static void expect_float16_storage_bitwise_eq(const StorageView& got,
+                                              const StorageView& expected) {
+  ASSERT_EQ(got.dtype(), DataType::FLOAT16);
+  ASSERT_EQ(expected.dtype(), DataType::FLOAT16);
+  assert_vector_eq(got.shape(), expected.shape());
+  const StorageView got_cpu = got.to(Device::CPU);
+  const StorageView expected_cpu = expected.to(Device::CPU);
+  EXPECT_EQ(std::memcmp(got_cpu.data<float16_t>(),
+                        expected_cpu.data<float16_t>(),
+                        static_cast<size_t>(got.size()) * sizeof(float16_t)),
+            0);
+}
+
+TEST(SYCLOpTest, BiasAddSplit3MatchesSequentialBitwise) {
+  if (get_device_count(Device::SYCL) == 0
+      || !mayiuse_float16(Device::SYCL))
+    GTEST_SKIP() << "No FP16-capable SYCL device is available.";
+
+  std::vector<float> input_values(3 * 1 * 12);
+  for (size_t i = 0; i < input_values.size(); ++i)
+    input_values[i] = (static_cast<int>(i % 13) - 6) * 0.137f;
+  const StorageView input_cpu(
+    {3, 1, 12}, input_values);
+  const StorageView bias_cpu(
+    {12},
+    std::vector<float>{0.031f, -0.047f, 0.089f, -0.113f,
+                       0.173f, -0.211f, 0.257f, -0.293f,
+                       0.337f, -0.379f, 0.419f, -0.461f});
+  const StorageView input = input_cpu.to(DataType::FLOAT16).to(Device::SYCL);
+  const StorageView bias = bias_cpu.to(DataType::FLOAT16).to(Device::SYCL);
+
+  StorageView biased(DataType::FLOAT16, Device::SYCL);
+  StorageView expected0(DataType::FLOAT16, Device::SYCL);
+  StorageView expected1(DataType::FLOAT16, Device::SYCL);
+  StorageView expected2(DataType::FLOAT16, Device::SYCL);
+  ops::BiasAdd()(input, bias, biased);
+  ops::Split(-1)(biased, expected0, expected1, expected2);
+
+  StorageView output0(DataType::FLOAT16, Device::SYCL);
+  StorageView output1(DataType::FLOAT16, Device::SYCL);
+  StorageView output2(DataType::FLOAT16, Device::SYCL);
+  ops::BiasAdd().split3(input, bias, output0, output1, output2);
+
+  expect_float16_storage_bitwise_eq(output0, expected0);
+  expect_float16_storage_bitwise_eq(output1, expected1);
+  expect_float16_storage_bitwise_eq(output2, expected2);
+
+  StorageView aliased_input = input;
+  EXPECT_THROW(ops::BiasAdd().split3(
+                 aliased_input, bias, aliased_input, output1, output2),
+               std::invalid_argument);
+  EXPECT_THROW(ops::BiasAdd().split3(
+                 input, bias, output0, output0, output2),
+               std::invalid_argument);
+}
+
+TEST(SYCLLayerTest, DenseProjectAndSplit3MatchesRegularPathBitwise) {
+  if (get_device_count(Device::SYCL) == 0
+      || !mayiuse_float16(Device::SYCL))
+    GTEST_SKIP() << "No FP16-capable SYCL device is available.";
+
+  class DenseSplitModel : public models::Model {
+  public:
+    DenseSplitModel() {
+      constexpr dim_t input_size = 8;
+      constexpr dim_t output_size = 12;
+      std::vector<float> weights(input_size * output_size);
+      for (size_t i = 0; i < weights.size(); ++i)
+        weights[i] = (static_cast<int>(i % 17) - 8) * 0.023f;
+      register_variable("dense/weight", StorageView({output_size, input_size}, weights));
+      register_variable(
+        "dense/bias",
+        StorageView({output_size},
+                    std::vector<float>{0.031f, -0.047f, 0.089f, -0.113f,
+                                       0.173f, -0.211f, 0.257f, -0.293f,
+                                       0.337f, -0.379f, 0.419f, -0.461f}));
+      set_compute_type(ComputeType::FLOAT16, Device::SYCL, 0, true);
+      set_device(Device::SYCL);
+    }
+
+  protected:
+    std::unique_ptr<models::Model> clone() const override {
+      return nullptr;
+    }
+  } model;
+
+  std::vector<float> input_values(3 * 1 * 8);
+  for (size_t i = 0; i < input_values.size(); ++i)
+    input_values[i] = (static_cast<int>(i % 11) - 5) * 0.071f;
+  const StorageView input = StorageView({3, 1, 8}, input_values)
+                              .to(DataType::FLOAT16)
+                              .to(Device::SYCL);
+  layers::Dense dense(model, "dense");
+
+  StorageView regular(DataType::FLOAT16, Device::SYCL);
+  dense(input, regular);
+  StorageView expected0(DataType::FLOAT16, Device::SYCL);
+  StorageView expected1(DataType::FLOAT16, Device::SYCL);
+  StorageView expected2(DataType::FLOAT16, Device::SYCL);
+  ops::Split(-1)(regular, expected0, expected1, expected2);
+
+  StorageView projection(DataType::FLOAT16, Device::SYCL);
+  StorageView output0(DataType::FLOAT16, Device::SYCL);
+  StorageView output1(DataType::FLOAT16, Device::SYCL);
+  StorageView output2(DataType::FLOAT16, Device::SYCL);
+  ASSERT_TRUE(dense.project_and_split3(
+    input, projection, output0, output1, output2));
+
+  expect_float16_storage_bitwise_eq(output0, expected0);
+  expect_float16_storage_bitwise_eq(output1, expected1);
+  expect_float16_storage_bitwise_eq(output2, expected2);
+
+  StorageView prefill = input;
+  prefill.reshape({1, 3, 8});
+  EXPECT_FALSE(dense.project_and_split3(
+    prefill, projection, output0, output1, output2));
+}
+#endif
 
 TEST_P(OpDeviceFPTest, BiasAddGELU) {
     const Device device = GetParam().device;

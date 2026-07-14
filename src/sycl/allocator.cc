@@ -243,6 +243,12 @@ namespace ctranslate2 {
           DeviceCache& cache = get_cache(device_index);
           std::lock_guard<std::mutex> retirement_lock(cache.retirement_mutex);
 
+          const size_t max_cached_bytes = get_max_cached_bytes();
+          // Leave headroom below the hard cache ceiling. Without hysteresis,
+          // the next small free commonly crosses the ceiling again and forces
+          // another device-wide retirement barrier.
+          const size_t target_cached_bytes = max_cached_bytes - max_cached_bytes / 4;
+
           size_t pending_bytes = 0;
           std::vector<CachedBlock> pending
             = take_pending_allocations(cache, pending_bytes);
@@ -259,7 +265,7 @@ namespace ctranslate2 {
           std::vector<CachedBlock> blocks_to_free;
           {
             std::lock_guard<std::mutex> lock(cache.mutex);
-            while (pooled_bytes(cache) > get_max_cached_bytes()
+            while (pooled_bytes(cache) > target_cached_bytes
                    && !cache.cached_allocations.empty()) {
               auto it = std::prev(cache.cached_allocations.end());
               cache.cached_bytes -= it->second.size;

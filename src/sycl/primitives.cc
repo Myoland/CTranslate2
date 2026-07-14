@@ -32,6 +32,49 @@ namespace ctranslate2 {
         return static_cast<T>(value);
     }
 
+    // Copies the contiguous innermost rows while swapping dimensions 1 and 2.
+    // This is the permutation used to split and combine attention heads.  One
+    // work-group owns each row so that the index permutation is computed once
+    // per group instead of once per element.
+    template <typename T>
+    void transpose_0213(const T* input,
+                        T* output,
+                        const dim_t dim0,
+                        const dim_t dim1,
+                        const dim_t dim2,
+                        const dim_t depth) {
+      auto& queue = sycl_backend::get_queue();
+      const size_t max_work_group_size
+        = queue.get_device().get_info<::sycl::info::device::max_work_group_size>();
+      const auto max_work_item_sizes
+        = queue.get_device().get_info<::sycl::info::device::max_work_item_sizes<3>>();
+      const size_t local_size = std::min({static_cast<size_t>(depth),
+                                          size_t(256),
+                                          max_work_group_size,
+                                          max_work_item_sizes[2]});
+      const size_t global_size2 = static_cast<size_t>(dim1) * local_size;
+
+      queue.parallel_for(
+        ::sycl::nd_range<3>(
+          ::sycl::range<3>(static_cast<size_t>(dim0),
+                           static_cast<size_t>(dim2),
+                           global_size2),
+          ::sycl::range<3>(1, 1, local_size)),
+        [=](::sycl::nd_item<3> item) {
+          const dim_t i0 = static_cast<dim_t>(item.get_group(0));
+          const dim_t i1 = static_cast<dim_t>(item.get_group(2));
+          const dim_t i2 = static_cast<dim_t>(item.get_group(1));
+          const dim_t input_row = (i0 * dim1 + i1) * dim2 + i2;
+          const dim_t output_row = (i0 * dim2 + i2) * dim1 + i1;
+
+          for (dim_t i = static_cast<dim_t>(item.get_local_id(2));
+               i < depth;
+               i += static_cast<dim_t>(local_size)) {
+            output[output_row * depth + i] = input[input_row * depth + i];
+          }
+        });
+    }
+
     template <typename T, typename Accumulator, typename BinaryOp, typename Transform>
     Accumulator reduce(const T* input,
                        const dim_t size,
@@ -607,6 +650,45 @@ namespace ctranslate2 {
                                                const dim_t* dims,
                                                const dim_t* perm,
                                                T* output) {
+    const dim_t size = dims[0] * dims[1] * dims[2] * dims[3];
+    if (size <= 0)
+      return;
+
+    const auto* device_input = sycl_backend::device_cast(input);
+    auto* device_output = sycl_backend::device_cast(output);
+
+    if (perm[0] == 0 && perm[1] == 2 && perm[2] == 1 && perm[3] == 3) {
+      // Optimize the permutation used in multi-head attention.  The 16-byte
+      // copy preserves the underlying bits, including floating-point NaNs.
+      using DeviceT = sycl_backend::device_type_t<T>;
+      using Copy16 = ::sycl::vec<uint32_t, 4>;
+      static_assert(sizeof(Copy16) == 16, "Copy16 must be 16 bytes");
+      static_assert(alignof(Copy16) == 16, "Copy16 must be 16-byte aligned");
+      static_assert(sizeof(Copy16) % sizeof(DeviceT) == 0,
+                    "Device element size must divide Copy16");
+
+      constexpr dim_t elements_per_copy = sizeof(Copy16) / sizeof(DeviceT);
+      const bool aligned
+        = reinterpret_cast<uintptr_t>(device_input) % alignof(Copy16) == 0
+          && reinterpret_cast<uintptr_t>(device_output) % alignof(Copy16) == 0;
+      if (aligned && dims[3] % elements_per_copy == 0) {
+        transpose_0213(reinterpret_cast<const Copy16*>(device_input),
+                       reinterpret_cast<Copy16*>(device_output),
+                       dims[0],
+                       dims[1],
+                       dims[2],
+                       dims[3] / elements_per_copy);
+      } else {
+        transpose_0213(device_input,
+                       device_output,
+                       dims[0],
+                       dims[1],
+                       dims[2],
+                       dims[3]);
+      }
+      return;
+    }
+
     const dim_t a_strides[4] = {
       dims[1] * dims[2] * dims[3],
       dims[2] * dims[3],
@@ -622,11 +704,6 @@ namespace ctranslate2 {
     const dim_t output_dim3 = dims[perm[3]];
     const dim_t output_stride0 = output_dim1 * output_dim2 * output_dim3;
     const dim_t output_stride1 = output_dim2 * output_dim3;
-    const dim_t size = dims[0] * dims[1] * dims[2] * dims[3];
-    if (size <= 0)
-      return;
-    const auto* device_input = sycl_backend::device_cast(input);
-    auto* device_output = sycl_backend::device_cast(output);
     sycl_backend::get_queue().parallel_for(
       ::sycl::range<1>(static_cast<size_t>(size)),
       [=](::sycl::id<1> id) {
@@ -738,18 +815,18 @@ namespace ctranslate2 {
 
   namespace {
 
-    template <typename In, typename Out>
+    template <typename In, typename Out, typename Scalar>
     void submit_gemm(const bool transpose_a,
                      const bool transpose_b,
                      const dim_t m,
                      const dim_t n,
                      const dim_t k,
-                     const float alpha,
+                     const Scalar alpha,
                      const In* a,
                      const dim_t lda,
                      const In* b,
                      const dim_t ldb,
-                     const float beta,
+                     const Scalar beta,
                      Out* c,
                      const dim_t ldc) {
       oneapi::mkl::blas::row_major::gemm(sycl_backend::get_queue(),
@@ -768,20 +845,20 @@ namespace ctranslate2 {
                                           ldc);
     }
 
-    template <typename In, typename Out>
+    template <typename In, typename Out, typename Scalar>
     void submit_gemm_batch(const bool transpose_a,
                            const bool transpose_b,
                            const dim_t m,
                            const dim_t n,
                            const dim_t k,
-                           const float alpha,
+                           const Scalar alpha,
                            const In* a,
                            const dim_t lda,
                            const dim_t stridea,
                            const In* b,
                            const dim_t ldb,
                            const dim_t strideb,
-                           const float beta,
+                           const Scalar beta,
                            Out* c,
                            const dim_t ldc,
                            const dim_t stridec,
@@ -851,6 +928,58 @@ namespace ctranslate2 {
       if (k <= 0 || alpha == 0.f) {
         scale_matrix(c, m, n, ldc, stridec, batch_size, beta);
         return;
+      }
+
+      if constexpr (std::is_same_v<T, float16_t>) {
+        // The native half-output oneMKL overload avoids an FP32 output
+        // workspace and the two conversion kernels.  That overload also takes
+        // half-precision alpha and beta, so only use it when converting these
+        // scalars is lossless.  Preserve the mixed-precision path below for
+        // arbitrary scaling factors.
+        const ::sycl::half half_alpha(alpha);
+        const ::sycl::half half_beta(beta);
+        if (std::isfinite(alpha)
+            && std::isfinite(beta)
+            && static_cast<float>(half_alpha) == alpha
+            && static_cast<float>(half_beta) == beta) {
+          const auto* device_a = sycl_backend::device_cast(a);
+          const auto* device_b = sycl_backend::device_cast(b);
+          auto* device_c = sycl_backend::device_cast(c);
+          if (batch_size == 1) {
+            submit_gemm(transpose_a,
+                        transpose_b,
+                        m,
+                        n,
+                        k,
+                        half_alpha,
+                        device_a,
+                        lda,
+                        device_b,
+                        ldb,
+                        half_beta,
+                        device_c,
+                        ldc);
+          } else {
+            submit_gemm_batch(transpose_a,
+                              transpose_b,
+                              m,
+                              n,
+                              k,
+                              half_alpha,
+                              device_a,
+                              lda,
+                              stridea,
+                              device_b,
+                              ldb,
+                              strideb,
+                              half_beta,
+                              device_c,
+                              ldc,
+                              stridec,
+                              batch_size);
+          }
+          return;
+        }
       }
 
       const dim_t matrix_span = (m - 1) * ldc + n;

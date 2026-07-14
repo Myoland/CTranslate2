@@ -16,12 +16,27 @@ namespace ctranslate2 {
                       StorageView& output,
                       const StorageView* residual = nullptr) const;
 
+      // Adds a last-dimension bias and scatters 3 equal parts in one kernel.
+      // This specialized path is used by iterative FP16 QKV projections.
+      void split3(const StorageView& value,
+                  const StorageView& bias,
+                  StorageView& output1,
+                  StorageView& output2,
+                  StorageView& output3) const;
+
     private:
       template <Device D, typename T>
       void compute(const StorageView& value,
                    const StorageView& bias,
                    StorageView& output,
                    const StorageView* residual) const;
+
+      template <typename T>
+      void compute_split3(const StorageView& value,
+                          const StorageView& bias,
+                          StorageView& output1,
+                          StorageView& output2,
+                          StorageView& output3) const;
 
       const ActivationType* _activation_type;
       const dim_t _axis;

@@ -132,6 +132,14 @@ namespace ctranslate2 {
       DataType output_type() const override;
       dim_t output_size() const override;
       void operator()(const StorageView& input, StorageView& output, const StorageView* residual = nullptr) const;
+      // Runs a narrowly supported FP16 projection and fuses its bias addition
+      // with a 3-way last-dimension split. Returns false when the regular path
+      // should be used instead.
+      bool project_and_split3(const StorageView& input,
+                              StorageView& projection,
+                              StorageView& output1,
+                              StorageView& output2,
+                              StorageView& output3) const;
       void select_weights(const StorageView* index, const StorageView* extra_bias = nullptr);
     private:
       bool _packed_weight;

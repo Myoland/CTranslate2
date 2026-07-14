@@ -1,6 +1,8 @@
 #include "ctranslate2/layers/common.h"
 
 #include <cmath>
+#include <cstdint>
+#include <limits>
 
 #include "ctranslate2/ops/activation.h"
 #include "cpu/backend.h"
@@ -8,6 +10,27 @@
 
 namespace ctranslate2 {
   namespace layers {
+    namespace {
+
+      bool storage_ranges_overlap(const StorageView& a, const StorageView& b) {
+        if (&a == &b)
+          return true;
+        if (!a.buffer() || !b.buffer())
+          return false;
+
+        const auto a_begin = reinterpret_cast<std::uintptr_t>(a.buffer());
+        const auto b_begin = reinterpret_cast<std::uintptr_t>(b.buffer());
+        const auto a_bytes = static_cast<std::uintptr_t>(a.reserved_memory());
+        const auto b_bytes = static_cast<std::uintptr_t>(b.reserved_memory());
+        if (a_bytes > std::numeric_limits<std::uintptr_t>::max() - a_begin
+            || b_bytes > std::numeric_limits<std::uintptr_t>::max() - b_begin)
+          return true;
+        const auto a_end = a_begin + a_bytes;
+        const auto b_end = b_begin + b_bytes;
+        return a_begin < b_end && b_begin < a_end;
+      }
+
+    }
 
     StorageView
     make_sequence_inputs(const std::vector<std::vector<size_t>>& ids,
@@ -439,6 +462,76 @@ namespace ctranslate2 {
       } else {
         _gemm_op(input, *weight, output, nullptr, bias, residual);
       }
+    }
+
+    bool Dense::project_and_split3(const StorageView& input,
+                                   StorageView& projection,
+                                   StorageView& output1,
+                                   StorageView& output2,
+                                   StorageView& output3) const {
+#ifdef CT2_WITH_SYCL
+      // Keep this path intentionally narrow. In particular, quantization,
+      // selected weights, activations, residuals, and packed weights continue
+      // through the regular Dense implementation.
+      if (input.device() != Device::SYCL
+          || input.dtype() != DataType::FLOAT16
+          || input.rank() != 3
+          || input.dim(1) != 1
+          || input.size() == 0
+          || _weight.device() != input.device()
+          || _weight.device_index() != input.device_index()
+          || _weight.dtype() != input.dtype()
+          || _weight.rank() != 2
+          || _weight.dim(1) != input.dim(2)
+          || _weight.dim(0) % 3 != 0
+          || !_bias
+          || _bias->device() != input.device()
+          || _bias->device_index() != input.device_index()
+          || _bias->dtype() != input.dtype()
+          || _bias->rank() != 1
+          || _bias->size() != _weight.dim(0)
+          || _packed_weight
+          || _quantized_gemm
+          || _qscale
+          || _qzero
+          || _u8_shift_compensation
+          || _activation_type
+          || _is_layer_out
+          || !_partial_weight.empty()
+          || !_partial_bias.empty()
+          || !_partial_qscale.empty()
+          || !_partial_u8_shift_compensation.empty())
+        return false;
+
+      const StorageView* outputs[] = {&projection, &output1, &output2, &output3};
+      for (size_t i = 0; i < 4; ++i) {
+        if (outputs[i]->device() != input.device()
+            || outputs[i]->device_index() != input.device_index()
+            || outputs[i]->dtype() != input.dtype()
+            || storage_ranges_overlap(input, *outputs[i])
+            || storage_ranges_overlap(_weight, *outputs[i])
+            || storage_ranges_overlap(*_bias, *outputs[i]))
+          return false;
+        for (size_t j = 0; j < i; ++j) {
+          if (storage_ranges_overlap(*outputs[j], *outputs[i]))
+            return false;
+        }
+      }
+
+      // The regular Gemm path applies the bias after oneMKL returns. Submit
+      // the identical Gemm without postprocessing, then perform the same FP32
+      // addition and FP16 rounding while scattering the Q, K, and V thirds.
+      _gemm_op(input, _weight, projection);
+      ops::BiasAdd().split3(projection, *_bias, output1, output2, output3);
+      return true;
+#else
+      (void)input;
+      (void)projection;
+      (void)output1;
+      (void)output2;
+      (void)output3;
+      return false;
+#endif
     }
 
 

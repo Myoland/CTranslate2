@@ -4,6 +4,7 @@
 #include "ctranslate2/ops/topp_mask.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 
@@ -46,6 +47,362 @@ namespace ctranslate2 {
                                      current_index));
       }
 
+      constexpr size_t max_topk_blocks = 128;
+      constexpr size_t topk_items_per_work_item = 8;
+
+      template <size_t K, typename IndexT>
+      inline void insert_topk_candidate(const float candidate_value,
+                                        const IndexT candidate_index,
+                                        std::array<float, K>& top_values,
+                                        std::array<IndexT, K>& top_indices,
+                                        const IndexT invalid_index) {
+        float value = candidate_value;
+        IndexT index = candidate_index;
+
+        for (size_t slot = 0; slot < K; ++slot) {
+          if (is_better_candidate(value,
+                                  index,
+                                  top_values[slot],
+                                  top_indices[slot],
+                                  invalid_index)) {
+            const float displaced_value = top_values[slot];
+            const IndexT displaced_index = top_indices[slot];
+            top_values[slot] = value;
+            top_indices[slot] = index;
+            value = displaced_value;
+            index = displaced_index;
+          }
+        }
+      }
+
+      inline size_t topk_num_blocks(const dim_t depth,
+                                    const dim_t k,
+                                    const size_t work_group_size) {
+        const size_t depth_size = static_cast<size_t>(depth);
+        const size_t k_size = static_cast<size_t>(k);
+        const size_t items_per_group = work_group_size * topk_items_per_work_item;
+        const size_t blocks_for_parallelism
+          = (depth_size + items_per_group - 1) / items_per_group;
+        // Do not create more partial lists than the input can populate. This
+        // keeps the temporary allocation bounded when k approaches depth.
+        const size_t blocks_for_candidates = std::max<size_t>(1, depth_size / k_size);
+        return std::max<size_t>(1,
+                                std::min({max_topk_blocks,
+                                          blocks_for_parallelism,
+                                          blocks_for_candidates}));
+      }
+
+      template <size_t K, typename DT, typename IndexT>
+      void submit_specialized_topk(::sycl::queue& queue,
+                                   const DT* input,
+                                   DT* result_values,
+                                   IndexT* result_indices,
+                                   DT* partial_values,
+                                   IndexT* partial_indices,
+                                   const dim_t rows,
+                                   const dim_t depth,
+                                   const size_t blocks,
+                                   const size_t work_group_size) {
+        const IndexT invalid_index = static_cast<IndexT>(depth);
+
+        queue.submit([&](::sycl::handler& handler) {
+          ::sycl::local_accessor<float, 1> local_values(work_group_size, handler);
+          ::sycl::local_accessor<IndexT, 1> local_indices(work_group_size, handler);
+          ::sycl::local_accessor<uint32_t, 1> local_lanes(work_group_size, handler);
+          handler.parallel_for(
+            ::sycl::nd_range<1>(static_cast<size_t>(rows) * blocks * work_group_size,
+                                work_group_size),
+            [=](::sycl::nd_item<1> item) {
+              const size_t group = item.get_group(0);
+              const dim_t row = static_cast<dim_t>(group / blocks);
+              const size_t block = group % blocks;
+              const size_t lid = item.get_local_id(0);
+              std::array<float, K> thread_values;
+              std::array<IndexT, K> thread_indices;
+
+              for (size_t rank = 0; rank < K; ++rank) {
+                thread_values[rank] = -std::numeric_limits<float>::infinity();
+                thread_indices[rank] = invalid_index;
+              }
+
+              const dim_t first_col
+                = static_cast<dim_t>(block * work_group_size + lid);
+              const dim_t col_stride
+                = static_cast<dim_t>(blocks * work_group_size);
+              for (dim_t col = first_col; col < depth; col += col_stride) {
+                insert_topk_candidate<K>(
+                  sycl_backend::to_float(input[row * depth + col]),
+                  static_cast<IndexT>(col),
+                  thread_values,
+                  thread_indices,
+                  invalid_index);
+              }
+
+              size_t cursor = 0;
+              const size_t partial_offset = group * K;
+              for (size_t rank = 0; rank < K; ++rank) {
+                local_values[lid] = thread_values[cursor];
+                local_indices[lid] = thread_indices[cursor];
+                local_lanes[lid] = static_cast<uint32_t>(lid);
+                item.barrier(::sycl::access::fence_space::local_space);
+
+                for (size_t stride = work_group_size / 2; stride > 0; stride >>= 1) {
+                  if (lid < stride
+                      && is_better_candidate(local_values[lid + stride],
+                                             local_indices[lid + stride],
+                                             local_values[lid],
+                                             local_indices[lid],
+                                             invalid_index)) {
+                    local_values[lid] = local_values[lid + stride];
+                    local_indices[lid] = local_indices[lid + stride];
+                    local_lanes[lid] = local_lanes[lid + stride];
+                  }
+                  item.barrier(::sycl::access::fence_space::local_space);
+                }
+
+                const uint32_t winner_lane = local_lanes[0];
+                const float winner_value = local_values[0];
+                const IndexT winner_index = local_indices[0];
+                if (lid == winner_lane && cursor + 1 < K)
+                  ++cursor;
+                if (lid == 0) {
+                  partial_values[partial_offset + rank]
+                    = sycl_backend::from_float<DT>(winner_value);
+                  partial_indices[partial_offset + rank] = winner_index;
+                }
+                item.barrier(::sycl::access::fence_space::local_space);
+              }
+            });
+        });
+
+        queue.submit([&](::sycl::handler& handler) {
+          ::sycl::local_accessor<float, 1> local_values(work_group_size, handler);
+          ::sycl::local_accessor<IndexT, 1> local_indices(work_group_size, handler);
+          ::sycl::local_accessor<uint32_t, 1> local_lanes(work_group_size, handler);
+          handler.parallel_for(
+            ::sycl::nd_range<1>(static_cast<size_t>(rows) * work_group_size,
+                                work_group_size),
+            [=](::sycl::nd_item<1> item) {
+              const dim_t row = static_cast<dim_t>(item.get_group(0));
+              const size_t lid = item.get_local_id(0);
+              std::array<float, K> thread_values;
+              std::array<IndexT, K> thread_indices;
+
+              for (size_t rank = 0; rank < K; ++rank) {
+                thread_values[rank] = -std::numeric_limits<float>::infinity();
+                thread_indices[rank] = invalid_index;
+              }
+
+              const size_t candidate_count = blocks * K;
+              const size_t row_offset = static_cast<size_t>(row) * candidate_count;
+              for (size_t candidate = lid;
+                   candidate < candidate_count;
+                   candidate += work_group_size) {
+                const IndexT candidate_index = partial_indices[row_offset + candidate];
+                if (candidate_index == invalid_index)
+                  continue;
+                insert_topk_candidate<K>(
+                  sycl_backend::to_float(partial_values[row_offset + candidate]),
+                  candidate_index,
+                  thread_values,
+                  thread_indices,
+                  invalid_index);
+              }
+
+              size_t cursor = 0;
+              for (size_t rank = 0; rank < K; ++rank) {
+                local_values[lid] = thread_values[cursor];
+                local_indices[lid] = thread_indices[cursor];
+                local_lanes[lid] = static_cast<uint32_t>(lid);
+                item.barrier(::sycl::access::fence_space::local_space);
+
+                for (size_t stride = work_group_size / 2; stride > 0; stride >>= 1) {
+                  if (lid < stride
+                      && is_better_candidate(local_values[lid + stride],
+                                             local_indices[lid + stride],
+                                             local_values[lid],
+                                             local_indices[lid],
+                                             invalid_index)) {
+                    local_values[lid] = local_values[lid + stride];
+                    local_indices[lid] = local_indices[lid + stride];
+                    local_lanes[lid] = local_lanes[lid + stride];
+                  }
+                  item.barrier(::sycl::access::fence_space::local_space);
+                }
+
+                const uint32_t winner_lane = local_lanes[0];
+                const float winner_value = local_values[0];
+                const IndexT winner_index = local_indices[0];
+                if (lid == winner_lane && cursor + 1 < K)
+                  ++cursor;
+                if (lid == 0) {
+                  result_values[row * K + rank]
+                    = sycl_backend::from_float<DT>(winner_value);
+                  result_indices[row * K + rank] = winner_index;
+                }
+                item.barrier(::sycl::access::fence_space::local_space);
+              }
+            });
+        });
+      }
+
+      template <typename DT, typename IndexT>
+      void submit_general_topk(::sycl::queue& queue,
+                               const DT* input,
+                               DT* result_values,
+                               IndexT* result_indices,
+                               DT* partial_values,
+                               IndexT* partial_indices,
+                               const dim_t rows,
+                               const dim_t depth,
+                               const dim_t k,
+                               const size_t blocks,
+                               const size_t work_group_size) {
+        const IndexT invalid_index = static_cast<IndexT>(depth);
+
+        queue.submit([&](::sycl::handler& handler) {
+          ::sycl::local_accessor<float, 1> local_values(work_group_size, handler);
+          ::sycl::local_accessor<IndexT, 1> local_indices(work_group_size, handler);
+          handler.parallel_for(
+            ::sycl::nd_range<1>(static_cast<size_t>(rows) * blocks * work_group_size,
+                                work_group_size),
+            [=](::sycl::nd_item<1> item) {
+              const size_t group = item.get_group(0);
+              const dim_t row = static_cast<dim_t>(group / blocks);
+              const size_t block = group % blocks;
+              const size_t lid = item.get_local_id(0);
+              float previous_value = -std::numeric_limits<float>::infinity();
+              IndexT previous_index = invalid_index;
+
+              for (dim_t rank = 0; rank < k; ++rank) {
+                float best = -std::numeric_limits<float>::infinity();
+                IndexT best_index = invalid_index;
+                const dim_t first_col
+                  = static_cast<dim_t>(block * work_group_size + lid);
+                const dim_t col_stride
+                  = static_cast<dim_t>(blocks * work_group_size);
+                for (dim_t col = first_col; col < depth; col += col_stride) {
+                  const float value = sycl_backend::to_float(input[row * depth + col]);
+                  const IndexT index = static_cast<IndexT>(col);
+                  if (rank != 0
+                      && (previous_index == invalid_index
+                          || !value_precedes(previous_value,
+                                             previous_index,
+                                             value,
+                                             index)))
+                    continue;
+                  if (is_better_candidate(value,
+                                          index,
+                                          best,
+                                          best_index,
+                                          invalid_index)) {
+                    best = value;
+                    best_index = index;
+                  }
+                }
+
+                local_values[lid] = best;
+                local_indices[lid] = best_index;
+                item.barrier(::sycl::access::fence_space::local_space);
+                for (size_t stride = work_group_size / 2; stride > 0; stride >>= 1) {
+                  if (lid < stride
+                      && is_better_candidate(local_values[lid + stride],
+                                             local_indices[lid + stride],
+                                             local_values[lid],
+                                             local_indices[lid],
+                                             invalid_index)) {
+                    local_values[lid] = local_values[lid + stride];
+                    local_indices[lid] = local_indices[lid + stride];
+                  }
+                  item.barrier(::sycl::access::fence_space::local_space);
+                }
+
+                previous_value = local_values[0];
+                previous_index = local_indices[0];
+                if (lid == 0) {
+                  const size_t offset = group * static_cast<size_t>(k)
+                                        + static_cast<size_t>(rank);
+                  partial_values[offset] = sycl_backend::from_float<DT>(previous_value);
+                  partial_indices[offset] = previous_index;
+                }
+                // All work-items must read the selected threshold before lane
+                // 0 can overwrite its reduction slot in the next iteration.
+                item.barrier(::sycl::access::fence_space::local_space);
+              }
+            });
+        });
+
+        queue.submit([&](::sycl::handler& handler) {
+          ::sycl::local_accessor<float, 1> local_values(work_group_size, handler);
+          ::sycl::local_accessor<IndexT, 1> local_indices(work_group_size, handler);
+          handler.parallel_for(
+            ::sycl::nd_range<1>(static_cast<size_t>(rows) * work_group_size,
+                                work_group_size),
+            [=](::sycl::nd_item<1> item) {
+              const dim_t row = static_cast<dim_t>(item.get_group(0));
+              const size_t lid = item.get_local_id(0);
+              const size_t candidate_count = blocks * static_cast<size_t>(k);
+              const size_t row_offset = static_cast<size_t>(row) * candidate_count;
+              float previous_value = -std::numeric_limits<float>::infinity();
+              IndexT previous_index = invalid_index;
+
+              for (dim_t rank = 0; rank < k; ++rank) {
+                float best = -std::numeric_limits<float>::infinity();
+                IndexT best_index = invalid_index;
+                for (size_t candidate = lid;
+                     candidate < candidate_count;
+                     candidate += work_group_size) {
+                  const IndexT index = partial_indices[row_offset + candidate];
+                  if (index == invalid_index)
+                    continue;
+                  const float value
+                    = sycl_backend::to_float(partial_values[row_offset + candidate]);
+                  if (rank != 0
+                      && (previous_index == invalid_index
+                          || !value_precedes(previous_value,
+                                             previous_index,
+                                             value,
+                                             index)))
+                    continue;
+                  if (is_better_candidate(value,
+                                          index,
+                                          best,
+                                          best_index,
+                                          invalid_index)) {
+                    best = value;
+                    best_index = index;
+                  }
+                }
+
+                local_values[lid] = best;
+                local_indices[lid] = best_index;
+                item.barrier(::sycl::access::fence_space::local_space);
+                for (size_t stride = work_group_size / 2; stride > 0; stride >>= 1) {
+                  if (lid < stride
+                      && is_better_candidate(local_values[lid + stride],
+                                             local_indices[lid + stride],
+                                             local_values[lid],
+                                             local_indices[lid],
+                                             invalid_index)) {
+                    local_values[lid] = local_values[lid + stride];
+                    local_indices[lid] = local_indices[lid + stride];
+                  }
+                  item.barrier(::sycl::access::fence_space::local_space);
+                }
+
+                previous_value = local_values[0];
+                previous_index = local_indices[0];
+                if (lid == 0) {
+                  result_values[row * k + rank]
+                    = sycl_backend::from_float<DT>(previous_value);
+                  result_indices[row * k + rank] = previous_index;
+                }
+                item.barrier(::sycl::access::fence_space::local_space);
+              }
+            });
+        });
+      }
+
       template <typename T>
       class TopPSortPolicy;
 
@@ -64,70 +421,56 @@ namespace ctranslate2 {
       const DT* input = sycl_backend::device_cast(x.data<T>());
       DT* result_values = sycl_backend::device_cast(values.data<T>());
       IndexT* result_indices = indices.data<IndexT>();
-      StorageView selection_mask(x.shape(), DataType::INT8, D);
-      int8_t* is_selected = selection_mask.data<int8_t>();
       const dim_t depth = x.dim(-1);
       const dim_t rows = x.size() / depth;
       const dim_t k = _k;
+      if (rows == 0)
+        return;
       const size_t wg = sycl_backend::work_group_size();
+      const size_t blocks = topk_num_blocks(depth, k, wg);
+      StorageView partial_values({rows * static_cast<dim_t>(blocks) * k}, x.dtype(), D);
+      StorageView partial_indices({rows * static_cast<dim_t>(blocks) * k},
+                                  DataType::INT32,
+                                  D);
+      DT* partial_values_data
+        = sycl_backend::device_cast(partial_values.data<T>());
+      IndexT* partial_indices_data = partial_indices.data<IndexT>();
       auto& queue = sycl_backend::get_queue();
 
-      queue.fill(is_selected, static_cast<int8_t>(0), x.size());
+#define SUBMIT_SPECIALIZED_TOPK(K)                                     \
+      submit_specialized_topk<K>(queue,                                \
+                                 input,                                \
+                                 result_values,                        \
+                                 result_indices,                       \
+                                 partial_values_data,                  \
+                                 partial_indices_data,                 \
+                                 rows,                                 \
+                                 depth,                                \
+                                 blocks,                               \
+                                 wg)
 
-      queue.submit([&](::sycl::handler& handler) {
-        ::sycl::local_accessor<float, 1> local_values(wg, handler);
-        ::sycl::local_accessor<IndexT, 1> local_indices(wg, handler);
-        handler.parallel_for(::sycl::nd_range<1>(rows * wg, wg), [=](::sycl::nd_item<1> item) {
-          const dim_t row = item.get_group(0);
-          const size_t lid = item.get_local_id(0);
-          for (dim_t rank = 0; rank < k; ++rank) {
-            float best = -std::numeric_limits<float>::infinity();
-            IndexT best_index = static_cast<IndexT>(depth);
-            for (dim_t col = lid; col < depth; col += wg) {
-              if (is_selected[row * depth + col])
-                continue;
+      switch (k) {
+      case 10: SUBMIT_SPECIALIZED_TOPK(10); break;
+      default:
+        submit_general_topk(queue,
+                            input,
+                            result_values,
+                            result_indices,
+                            partial_values_data,
+                            partial_indices_data,
+                            rows,
+                            depth,
+                            k,
+                            blocks,
+                            wg);
+        break;
+      }
 
-              const float value = sycl_backend::to_float(input[row * depth + col]);
-              if (is_better_candidate(value,
-                                      static_cast<IndexT>(col),
-                                      best,
-                                      best_index,
-                                      static_cast<IndexT>(depth))) {
-                best = value;
-                best_index = static_cast<IndexT>(col);
-              }
-            }
-            local_values[lid] = best;
-            local_indices[lid] = best_index;
-            item.barrier(::sycl::access::fence_space::local_space);
-            for (size_t stride = wg / 2; stride > 0; stride >>= 1) {
-              if (lid < stride) {
-                const float other = local_values[lid + stride];
-                const IndexT other_index = local_indices[lid + stride];
-                if (is_better_candidate(other,
-                                        other_index,
-                                        local_values[lid],
-                                        local_indices[lid],
-                                        static_cast<IndexT>(depth))) {
-                  local_values[lid] = other;
-                  local_indices[lid] = other_index;
-                }
-              }
-              item.barrier(::sycl::access::fence_space::local_space);
-            }
-            if (lid == 0) {
-              const IndexT selected = local_indices[0];
-              result_values[row * k + rank] = sycl_backend::from_float<DT>(local_values[0]);
-              result_indices[row * k + rank] = selected;
-              is_selected[row * depth + selected] = 1;
-            }
-            item.barrier(::sycl::access::fence_space::global_and_local);
-          }
-        });
-      });
+#undef SUBMIT_SPECIALIZED_TOPK
 
-      // Keep the selection mask alive until the final rank is written.
-      queue.wait_and_throw();
+      // The in-order queue keeps both stages ordered. StorageView destruction
+      // retires these buffers through the SYCL allocator's pending list, so
+      // they cannot be recycled while either kernel still references them.
     }
 
     template <Device D, typename T>
