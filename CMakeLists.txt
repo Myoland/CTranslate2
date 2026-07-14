@@ -1,4 +1,11 @@
-cmake_minimum_required(VERSION 3.7)
+cmake_minimum_required(VERSION 3.13)
+
+# CMake 4 no longer enables compatibility with policy versions older than 3.5.
+# Some vendored dependencies still declare an older minimum, so define the
+# compatibility floor centrally instead of modifying their source trees.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0")
+  set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+endif()
 
 # Set policy for setting the MSVC runtime library for static MSVC builds
 if(POLICY CMP0091)
@@ -15,6 +22,9 @@ option(WITH_RUY "Compile with Ruy backend" OFF)
 option(WITH_CUDA "Compile with CUDA backend" OFF)
 option(WITH_CUDNN "Compile with cuDNN backend" OFF)
 option(WITH_HIP "Compile with AMD HIP GPU backend" OFF)
+option(WITH_SYCL "Compile with Intel SYCL GPU backend" OFF)
+set(SYCL_TARGETS "spir64" CACHE STRING "SYCL offload target (spir64 or spir64_gen)")
+set(SYCL_AOT_DEVICE "" CACHE STRING "Intel GPU architecture passed to the spir64_gen backend")
 option(CUDA_DYNAMIC_LOADING "Dynamically load CUDA libraries at runtime" OFF)
 option(ENABLE_CPU_DISPATCH "Compile CPU kernels for multiple ISA and dispatch at runtime" ON)
 option(ENABLE_PROFILING "Compile with profiling support" OFF)
@@ -62,6 +72,47 @@ endif(NOT CMAKE_BUILD_TYPE)
 
 # Set CXX flags.
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(WITH_SYCL)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux"
+      OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(amd64)|(AMD64)")
+    message(FATAL_ERROR "WITH_SYCL=ON currently requires Linux x86-64")
+  endif()
+  if(NOT BUILD_SHARED_LIBS)
+    message(FATAL_ERROR "WITH_SYCL=ON currently requires BUILD_SHARED_LIBS=ON")
+  endif()
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    message(FATAL_ERROR "WITH_SYCL=ON requires Intel oneAPI icpx (IntelLLVM)")
+  endif()
+  if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "2026.1")
+    message(FATAL_ERROR "WITH_SYCL=ON requires Intel oneAPI DPC++/C++ Compiler 2026.1 or newer")
+  endif()
+  if(WITH_CUDA OR WITH_HIP)
+    message(FATAL_ERROR "WITH_SYCL=ON is incompatible with WITH_CUDA=ON and WITH_HIP=ON")
+  endif()
+  if(WITH_CUDNN OR WITH_FLASH_ATTN OR WITH_TENSOR_PARALLEL)
+    message(FATAL_ERROR
+      "WITH_SYCL=ON does not support cuDNN, Flash Attention 2, or tensor parallelism")
+  endif()
+  if(NOT WITH_MKL)
+    message(FATAL_ERROR "WITH_SYCL=ON requires WITH_MKL=ON for oneMKL SYCL")
+  endif()
+  if(NOT OPENMP_RUNTIME STREQUAL "INTEL")
+    message(FATAL_ERROR "WITH_SYCL=ON currently requires OPENMP_RUNTIME=INTEL")
+  endif()
+  if(NOT SYCL_TARGETS STREQUAL "spir64" AND NOT SYCL_TARGETS STREQUAL "spir64_gen")
+    message(FATAL_ERROR "SYCL_TARGETS must be spir64 or spir64_gen")
+  endif()
+  if(SYCL_AOT_DEVICE AND NOT SYCL_TARGETS STREQUAL "spir64_gen")
+    message(FATAL_ERROR "SYCL_AOT_DEVICE requires SYCL_TARGETS=spir64_gen")
+  endif()
+  if(SYCL_TARGETS STREQUAL "spir64_gen" AND NOT SYCL_AOT_DEVICE)
+    message(FATAL_ERROR "SYCL_TARGETS=spir64_gen requires SYCL_AOT_DEVICE")
+  endif()
+
+  add_compile_definitions(CT2_WITH_SYCL)
+endif()
 
 if(APPLE)
   set(CMAKE_OSX_DEPLOYMENT_TARGET 10.13)
@@ -256,6 +307,13 @@ set(CUDA_SOURCES
   src/ops/awq/gemv_gpu.cu
   src/ops/awq/dequantize_gpu.cu
 )
+if(WITH_SYCL)
+  file(GLOB SYCL_SOURCES CONFIGURE_DEPENDS
+    src/sycl/*.cc
+    src/ops/*_sycl.cc
+  )
+  list(APPEND SOURCES ${SYCL_SOURCES})
+endif()
 set(LIBRARIES
   ${CMAKE_THREAD_LIBS_INIT}
   spdlog::spdlog_header_only
@@ -378,7 +436,23 @@ if(WITH_MKL)
   endif()
 
   add_definitions(-DCT2_WITH_MKL -DMKL_ILP64)
-  if(WIN32)
+  if(WITH_SYCL)
+    # oneMKL 2026 only supports dynamic linking for the SYCL APIs. The
+    # imported targets also supply the host C API used by the CPU backend.
+    set(MKL_ARCH intel64)
+    set(MKL_INTERFACE ilp64)
+    set(MKL_LINK dynamic)
+    set(MKL_THREADING intel_thread)
+    find_package(MKL CONFIG REQUIRED
+      PATHS ${MKL_ROOT}/lib/cmake/mkl
+      NO_DEFAULT_PATH)
+    if(NOT TARGET MKL::MKL_SYCL::BLAS OR NOT TARGET MKL::MKL_SYCL::RNG)
+      message(FATAL_ERROR
+        "The installed oneMKL package does not provide the SYCL BLAS and RNG targets")
+    endif()
+    # These domain targets also link the host C API used by the CPU backend.
+    list(APPEND LIBRARIES MKL::MKL_SYCL::BLAS MKL::MKL_SYCL::RNG)
+  elseif(WIN32)
     set(MKL_LIBRARIES
       ${MKL_LIBRARY_DIR}/mkl_core.lib
       ${MKL_LIBRARY_DIR}/mkl_intel_ilp64.lib
@@ -391,19 +465,19 @@ if(WITH_MKL)
       )
   endif()
 
-  if(OPENMP_RUNTIME STREQUAL "INTEL")
+  if(NOT WITH_SYCL AND OPENMP_RUNTIME STREQUAL "INTEL")
     if(WIN32)
       list(APPEND MKL_LIBRARIES ${MKL_LIBRARY_DIR}/mkl_intel_thread.lib)
     else()
       list(APPEND MKL_LIBRARIES ${MKL_LIBRARY_DIR}/libmkl_intel_thread.a)
     endif()
-  elseif(OPENMP_RUNTIME STREQUAL "COMP")
+  elseif(NOT WITH_SYCL AND OPENMP_RUNTIME STREQUAL "COMP")
     if(WIN32)
       message(FATAL_ERROR "Building with MKL requires Intel OpenMP")
     else()
       list(APPEND MKL_LIBRARIES ${MKL_LIBRARY_DIR}/libmkl_gnu_thread.a)
     endif()
-  elseif(OPENMP_RUNTIME STREQUAL "NONE")
+  elseif(NOT WITH_SYCL AND OPENMP_RUNTIME STREQUAL "NONE")
     if(WIN32)
       list(APPEND MKL_LIBRARIES ${MKL_LIBRARY_DIR}/mkl_sequential.lib)
     else()
@@ -411,7 +485,9 @@ if(WITH_MKL)
     endif()
   endif()
   list(APPEND PRIVATE_INCLUDE_DIRECTORIES ${MKL_INCLUDE_DIR})
-  if(WIN32 OR APPLE)
+  if(WITH_SYCL)
+    # Linked through the oneMKL SYCL domain targets above.
+  elseif(WIN32 OR APPLE)
     list(APPEND LIBRARIES ${MKL_LIBRARIES})
   else()
     list(APPEND LIBRARIES -Wl,--start-group ${MKL_LIBRARIES} -Wl,--end-group)
@@ -772,6 +848,10 @@ elseif(WITH_HIP)
   set_target_properties(${PROJECT_NAME} PROPERTIES LINKER_LANGUAGE CXX)
 
 
+elseif(WITH_SYCL)
+  add_library(${PROJECT_NAME} ${SOURCES})
+
+
 elseif(WITH_CUDNN)
   message(FATAL_ERROR "WITH_CUDNN=ON requires WITH_CUDA=ON")
 else()
@@ -794,6 +874,23 @@ target_include_directories(${PROJECT_NAME} BEFORE
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
   PRIVATE ${PRIVATE_INCLUDE_DIRECTORIES}
 )
+
+if(WITH_SYCL)
+  set(SYCL_COMPILE_OPTIONS
+    -fsycl
+    -fsycl-targets=${SYCL_TARGETS}
+    -fsycl-device-code-split=per_kernel
+  )
+  target_compile_options(${PROJECT_NAME} PRIVATE ${SYCL_COMPILE_OPTIONS})
+  set(SYCL_LINK_OPTIONS
+    -fsycl
+    -fsycl-targets=${SYCL_TARGETS}
+  )
+  if(SYCL_AOT_DEVICE)
+    list(APPEND SYCL_LINK_OPTIONS -Xs "-device ${SYCL_AOT_DEVICE}")
+  endif()
+  target_link_options(${PROJECT_NAME} PRIVATE ${SYCL_LINK_OPTIONS})
+endif()
 
 if (WITH_TENSOR_PARALLEL AND CUDA_DYNAMIC_LOADING)
   target_compile_options(${PROJECT_NAME} PRIVATE -DOMPI_SKIP_MPICXX)

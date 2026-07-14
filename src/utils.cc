@@ -7,6 +7,9 @@
 #ifdef CT2_WITH_CUDA
 #  include "./cuda/utils.h"
 #endif
+#ifdef CT2_WITH_SYCL
+#  include "./sycl/utils.h"
+#endif
 
 #include <spdlog/spdlog.h>
 
@@ -68,10 +71,26 @@ namespace ctranslate2 {
       spdlog::info(" - Allow BF16: {}", mayiuse_bfloat16(Device::CUDA, i));
     }
 #endif
+
+#ifdef CT2_WITH_SYCL
+    for (int i = 0; i < sycl_backend::get_device_count(); ++i) {
+      spdlog::info("SYCL GPU #{}: {} (backend={})",
+                   i,
+                   sycl_backend::get_device_name(i),
+                   sycl_backend::get_backend_name(i));
+      spdlog::info(" - Allow INT8: {}", sycl_backend::mayiuse_int8(i));
+      spdlog::info(" - Allow FP16: {}", sycl_backend::mayiuse_float16(i));
+      spdlog::info(" - Allow BF16: {}", sycl_backend::mayiuse_bfloat16(i));
+    }
+#endif
   }
 
   int get_gpu_count() {
     return get_device_count(Device::CUDA);
+  }
+
+  int get_sycl_device_count() {
+    return get_device_count(Device::SYCL);
   }
 
   static inline size_t get_default_num_threads() {

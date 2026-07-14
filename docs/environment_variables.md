@@ -64,6 +64,13 @@ Force CTranslate2 to select a specific instruction set architecture (ISA). Possi
 This does not impact backend libraries (such as Intel MKL) which usually have their own environment variables to configure ISA dispatching.
 ```
 
+## `CT2_SYCL_CACHING_ALLOCATOR_MAX_BYTES`
+
+Set the maximum number of bytes retained by the SYCL device-memory caching
+allocator. The default is 536870912 bytes (512 MiB). Set this variable before
+starting CTranslate2; use `0` to release each allocation after its outstanding
+SYCL work completes.
+
 ## `CT2_PACKED_GEMM`
 
 Enable or disable the packed GEMM API for Intel MKL. Packed GEMM is enabled by default when using the MKL backend and improves decoding performance by pre-packing weight matrices at model load time. Set to `0` to disable it. See [Intel's article](https://software.intel.com/content/www/us/en/develop/articles/introducing-the-new-packed-apis-for-gemm.html) to learn more about packed GEMM.
@@ -71,6 +78,9 @@ Enable or disable the packed GEMM API for Intel MKL. Packed GEMM is enabled by d
 ## `CT2_USE_MKL`
 
 Force CTranslate2 to use (or not) Intel MKL. By default, the runtime automatically decides whether to use Intel MKL or not based on the CPU vendor.
+
+When a SYCL build does not include another CPU GEMM backend, oneMKL is also
+used by default on non-Intel CPUs so that the CPU device remains usable.
 
 ## `CT2_VERBOSE`
 

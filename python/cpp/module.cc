@@ -54,7 +54,13 @@ PYBIND11_MODULE(_ext, m)
         "Helper function to check if a directory seems to contain a CTranslate2 model.");
 
   m.def("get_cuda_device_count", &ctranslate2::get_gpu_count,
-        "Returns the number of visible GPU devices.");
+        "Returns the number of visible CUDA devices.");
+
+  m.def("get_sycl_device_count", &ctranslate2::get_sycl_device_count,
+        "Returns the number of visible Intel Level Zero SYCL devices.");
+
+  m.def("get_xpu_device_count", &ctranslate2::get_xpu_device_count,
+        "Alias of get_sycl_device_count.");
 
   m.def("get_supported_compute_types", &get_supported_compute_types,
         py::arg("device"),
@@ -63,7 +69,7 @@ PYBIND11_MODULE(_ext, m)
              Returns the set of supported compute types on a device.
 
              Arguments:
-               device: Device name (cpu or cuda).
+               device: Device name (cpu, cuda, sycl, or xpu).
                device_index: Device index.
 
              Example:

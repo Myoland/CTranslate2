@@ -49,6 +49,24 @@ require_cuda = pytest.mark.skipif(
     ctranslate2.get_cuda_device_count() == 0, reason="Test case requires a CUDA device"
 )
 
-on_available_devices = pytest.mark.parametrize(
-    "device", ["cpu"] + (["cuda"] if ctranslate2.get_cuda_device_count() > 0 else [])
+require_sycl = pytest.mark.skipif(
+    ctranslate2.get_sycl_device_count() == 0, reason="Test case requires a SYCL device"
 )
+
+on_available_devices = pytest.mark.parametrize(
+    "device",
+    ["cpu"]
+    + (["cuda"] if ctranslate2.get_cuda_device_count() > 0 else [])
+    + (["sycl"] if ctranslate2.get_sycl_device_count() > 0 else []),
+)
+
+
+def test_xpu_device_count_alias():
+    assert ctranslate2.get_xpu_device_count() == ctranslate2.get_sycl_device_count()
+
+
+@require_sycl
+def test_sycl_compute_type_alias():
+    sycl_types = ctranslate2.get_supported_compute_types("sycl")
+    assert "float32" in sycl_types
+    assert ctranslate2.get_supported_compute_types("xpu") == sycl_types

@@ -11,7 +11,13 @@ namespace ctranslate2 {
   bool string_to_bool(const std::string& str);
 
   void log_system_config();
+  // Returns the number of visible CUDA devices. This function intentionally
+  // keeps its historical CUDA-only semantics.
   int get_gpu_count();
+  int get_sycl_device_count();
+  inline int get_xpu_device_count() {
+    return get_sycl_device_count();
+  }
   void set_num_threads(size_t num_threads);
 
   bool ends_with(const std::string& str, const std::string& suffix);

@@ -115,6 +115,9 @@ The following options can be set with `-DOPTION=VALUE` during the CMake configur
 | WITH_OPENBLAS | **OFF**, ON | Compiles with the OpenBLAS backend |
 | WITH_RUY | **OFF**, ON | Compiles with the Ruy backend |
 | WITH_HIP | **OFF**, ON | Compiles with the AMD HIP GPU backend |
+| WITH_SYCL | **OFF**, ON | Compiles with the Intel Level Zero SYCL backend |
+| SYCL_TARGETS | **spir64**, spir64_gen | Selects portable SPIR-V or Intel GPU AOT compilation |
+| SYCL_AOT_DEVICE | *empty*, Intel GPU architecture | Selects the Intel GPU architecture when `SYCL_TARGETS=spir64_gen` |
 
 Some build options require additional dependencies. See their respective documentation for installation instructions.
 
@@ -125,9 +128,12 @@ Some build options require additional dependencies. See their respective documen
 * `-DWITH_ACCELERATE=ON` requires [Accelerate](https://developer.apple.com/documentation/accelerate)
 * `-DWITH_OPENBLAS=ON` requires [OpenBLAS](https://github.com/xianyi/OpenBLAS)
 * `-DWITH_HIP=ON` requires [ROCm libraries](https://rocm.docs.amd.com/en/latest/reference/api-libraries.html)
+* `-DWITH_SYCL=ON` requires Intel oneAPI DPC++/C++ Compiler and oneMKL 2026.1 or newer; see the [SYCL backend guide](sycl.md)
 
 Multiple backends can be enabled for a single build, for example:
 
 * `-DWITH_MKL=ON -DWITH_CUDA=ON`: enable CPU and GPU support
 * `-DWITH_MKL=ON -DWITH_DNNL=ON`: during runtime, the library will select Intel MKL when running on Intel and oneDNN when running on AMD
 * `-DWITH_OPENBLAS=ON -DWITH_RUY=ON`: use Ruy for quantized models and OpenBLAS for non quantized models
+
+The initial SYCL backend is mutually exclusive with CUDA and HIP.

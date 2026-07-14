@@ -1,8 +1,14 @@
 #include "ctranslate2/devices.h"
 
+#include <algorithm>
+#include <cctype>
+
 #ifdef CT2_WITH_CUDA
 #  include "cuda/utils.h"
 #  include "cuda/random.h"
+#endif
+#ifdef CT2_WITH_SYCL
+#  include "sycl/utils.h"
 #endif
 #ifdef CT2_WITH_TENSOR_PARALLEL
 #  include <unistd.h>
@@ -13,20 +19,37 @@
 namespace ctranslate2 {
 
   Device str_to_device(const std::string& device) {
-    if (device == "cuda" || device == "CUDA")
+    std::string normalized_device(device);
+    std::transform(normalized_device.begin(),
+                   normalized_device.end(),
+                   normalized_device.begin(),
+                   [](const unsigned char c) { return std::tolower(c); });
+
+    if (normalized_device == "cuda")
 #ifdef CT2_WITH_CUDA
       return Device::CUDA;
 #else
       throw std::invalid_argument("This CTranslate2 package was not compiled with CUDA support");
 #endif
-    if (device == "cpu" || device == "CPU")
-      return Device::CPU;
-    if (device == "auto" || device == "AUTO")
-#ifdef CT2_WITH_CUDA
-      return cuda::has_gpu() ? Device::CUDA : Device::CPU;
+    if (normalized_device == "sycl" || normalized_device == "xpu")
+#ifdef CT2_WITH_SYCL
+      return Device::SYCL;
 #else
-      return Device::CPU;
+      throw std::invalid_argument("This CTranslate2 package was not compiled with SYCL support");
 #endif
+    if (normalized_device == "cpu")
+      return Device::CPU;
+    if (normalized_device == "auto") {
+#ifdef CT2_WITH_CUDA
+      if (cuda::has_gpu())
+        return Device::CUDA;
+#endif
+#ifdef CT2_WITH_SYCL
+      if (sycl_backend::has_gpu())
+        return Device::SYCL;
+#endif
+      return Device::CPU;
+    }
     throw std::invalid_argument("unsupported device " + device);
   }
 
@@ -34,6 +57,8 @@ namespace ctranslate2 {
     switch (device) {
     case Device::CUDA:
       return "cuda";
+    case Device::SYCL:
+      return "sycl";
     case Device::CPU:
       return "cpu";
     }
@@ -49,6 +74,12 @@ namespace ctranslate2 {
     case Device::CUDA:
 #ifdef CT2_WITH_CUDA
       return cuda::get_gpu_count();
+#else
+      return 0;
+#endif
+    case Device::SYCL:
+#ifdef CT2_WITH_SYCL
+      return sycl_backend::get_device_count();
 #else
       return 0;
 #endif
@@ -88,6 +119,18 @@ namespace ctranslate2 {
   }
 #endif
 
+#ifdef CT2_WITH_SYCL
+  template<>
+  int get_device_index<Device::SYCL>() {
+    return sycl_backend::get_device_index();
+  }
+
+  template<>
+  void set_device_index<Device::SYCL>(int index) {
+    sycl_backend::set_device_index(index);
+  }
+#endif
+
   int get_device_index(Device device) {
     int index = 0;
     DEVICE_DISPATCH(device, index = get_device_index<D>());
@@ -104,7 +147,12 @@ namespace ctranslate2 {
       const ScopedDeviceSetter scoped_device_setter(device, index);
       cudaDeviceSynchronize();
     }
-#else
+#endif
+#ifdef CT2_WITH_SYCL
+    if (device == Device::SYCL)
+      sycl_backend::synchronize(index);
+#endif
+#if !defined(CT2_WITH_CUDA) && !defined(CT2_WITH_SYCL)
     (void)device;
     (void)index;
 #endif
@@ -115,7 +163,12 @@ namespace ctranslate2 {
     if (device == Device::CUDA) {
       cudaStreamSynchronize(cuda::get_cuda_stream());
     }
-#else
+#endif
+#ifdef CT2_WITH_SYCL
+    if (device == Device::SYCL)
+      sycl_backend::synchronize_queue();
+#endif
+#if !defined(CT2_WITH_CUDA) && !defined(CT2_WITH_SYCL)
     (void)device;
 #endif
   }
@@ -125,7 +178,12 @@ namespace ctranslate2 {
       if (device == Device::CUDA) {
           cuda::free_curand_states();
       }
-#else
+#endif
+#ifdef CT2_WITH_SYCL
+      if (device == Device::SYCL)
+        sycl_backend::destroy_context();
+#endif
+#if !defined(CT2_WITH_CUDA) && !defined(CT2_WITH_SYCL)
       (void)device;
 #endif
   }

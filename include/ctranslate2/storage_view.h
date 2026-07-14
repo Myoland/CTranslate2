@@ -247,6 +247,14 @@ namespace ctranslate2 {
     dim_t _allocated_size = 0;
     dim_t _size = 0;
     Shape _shape;
+
+  private:
+    template <typename T>
+    StorageView& copy_from_device(const T* data,
+                                  dim_t size,
+                                  Device device,
+                                  bool synchronous,
+                                  int device_index);
   };
 
 }

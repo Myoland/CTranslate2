@@ -95,6 +95,32 @@ INSTANTIATE_TEST_SUITE_P(
     ),
   path_to_test_name);
 
+#ifdef CT2_WITH_SYCL
+TEST(SYCLTranslatorTest, TransliterationComputeTypes) {
+  if (get_device_count(Device::SYCL) == 0)
+    GTEST_SKIP() << "No compatible Intel Level Zero device is visible";
+
+  const std::string model_path = get_data_dir() + "/models/v2/aren-transliteration";
+  const std::vector<std::string> input = {"آ", "ت", "ز", "م", "و", "ن"};
+  const std::vector<std::string> expected = {"a", "t", "z", "m", "o", "n"};
+  const std::vector<ComputeType> compute_types = {
+    ComputeType::FLOAT32,
+    ComputeType::FLOAT16,
+    ComputeType::BFLOAT16,
+    ComputeType::INT8_FLOAT32,
+    ComputeType::INT8_FLOAT16,
+    ComputeType::INT8_BFLOAT16,
+  };
+
+  for (const ComputeType compute_type : compute_types) {
+    SCOPED_TRACE(compute_type_to_str(compute_type));
+    Translator translator(model_path, Device::SYCL, compute_type, std::vector<int>{0});
+    const auto result = translator.translate_batch({input})[0];
+    EXPECT_EQ(result.output(), expected);
+  }
+}
+#endif
+
 
 class SearchVariantTest : public ::testing::TestWithParam<size_t> {
 };
@@ -719,6 +745,12 @@ INSTANTIATE_TEST_SUITE_P(CPU, BiasedDecodingDeviceFPTest,
 INSTANTIATE_TEST_SUITE_P(CUDA, BiasedDecodingDeviceFPTest,
                          ::testing::Values(FloatType{Device::CUDA, DataType::FLOAT32},
                                            FloatType{Device::CUDA, DataType::FLOAT16}),
+                         fp_test_name);
+#endif
+#ifdef CT2_WITH_SYCL
+INSTANTIATE_TEST_SUITE_P(SYCL, BiasedDecodingDeviceFPTest,
+                         ::testing::Values(FloatType{Device::SYCL, DataType::FLOAT32},
+                                           FloatType{Device::SYCL, DataType::FLOAT16}),
                          fp_test_name);
 #endif
 

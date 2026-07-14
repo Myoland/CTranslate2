@@ -136,13 +136,17 @@ int main(int argc, char* argv[]) {
   }
 
   std::string op = argv[1];
-  Device device = std::string(argv[2]) == "cuda" ? Device::CUDA : Device::CPU;
+  Device device = str_to_device(argv[2]);
   std::string dtype_str = argc > 3 ? argv[3] : "float32";
   DataType dtype = DataType::FLOAT32;
   if (dtype_str == "int16")
     dtype = DataType::INT16;
   else if (dtype_str == "int8")
     dtype = DataType::INT8;
+  else if (dtype_str == "float16")
+    dtype = DataType::FLOAT16;
+  else if (dtype_str == "bfloat16")
+    dtype = DataType::BFLOAT16;
 
   if (op == "gather")
     benchmark_gather(device);

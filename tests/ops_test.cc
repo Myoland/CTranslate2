@@ -2,6 +2,7 @@
 #include "test_utils.h"
 #include "ctranslate2/layers/attention.h"
 #include "ctranslate2/ops/ops.h"
+#include "ctranslate2/random.h"
 
 TEST(OpTest, Transpose1D) {
   StorageView x({4}, std::vector<float>{1, 2, 3, 4});
@@ -769,6 +770,86 @@ TEST_P(OpDeviceTest, TopKChangeK) {
   expect_storage_eq(indices_k3, expected_indices_k3);
 }
 
+#ifdef CT2_WITH_SYCL
+TEST(SYCLTopKTest, SelectsDistinctNegativeInfinities) {
+  if (get_device_count(Device::SYCL) == 0)
+    GTEST_SKIP() << "No SYCL device is available.";
+
+  constexpr float inf = std::numeric_limits<float>::infinity();
+  const StorageView input({2, 4},
+                          std::vector<float>{5.f, -inf, -inf, -inf,
+                                             -inf, -inf, -inf, -inf},
+                          Device::SYCL);
+  const StorageView expected_values({2, 4},
+                                    std::vector<float>{5.f, -inf, -inf, -inf,
+                                                       -inf, -inf, -inf, -inf});
+  const StorageView expected_indices({2, 4},
+                                     std::vector<int32_t>{0, 1, 2, 3,
+                                                          0, 1, 2, 3});
+  StorageView values(DataType::FLOAT32, Device::SYCL);
+  StorageView indices(DataType::INT32, Device::SYCL);
+
+  ops::TopK(4)(input, values, indices);
+
+  expect_storage_eq(values, expected_values);
+  expect_storage_eq(indices, expected_indices);
+}
+
+TEST(SYCLTopKTest, SelectsAllNaNsWithoutOutOfBoundsAccess) {
+  if (get_device_count(Device::SYCL) == 0)
+    GTEST_SKIP() << "No SYCL device is available.";
+
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const StorageView input({1, 4}, std::vector<float>{nan, nan, nan, nan}, Device::SYCL);
+  const StorageView expected_indices({1, 4}, std::vector<int32_t>{0, 1, 2, 3});
+  StorageView values(DataType::FLOAT32, Device::SYCL);
+  StorageView indices(DataType::INT32, Device::SYCL);
+
+  ops::TopK(4)(input, values, indices);
+
+  expect_storage_eq(indices, expected_indices);
+  const StorageView values_cpu = values.to(Device::CPU);
+  for (dim_t i = 0; i < values_cpu.size(); ++i)
+    EXPECT_TRUE(std::isnan(values_cpu.data<float>()[i]));
+}
+
+TEST(SYCLRandomTest, PreservesEachDeviceSequenceWhenSwitchingDevices) {
+  if (get_device_count(Device::SYCL) < 2)
+    GTEST_SKIP() << "This test requires at least 2 SYCL devices.";
+
+  constexpr dim_t size = 16;
+  const int initial_device = get_device_index(Device::SYCL);
+  set_random_seed(1234);
+  destroy_context(Device::SYCL);
+
+  const auto sample = [](const int device_index) {
+    set_device_index(Device::SYCL, device_index);
+    const StorageView input({size}, 0.f, Device::SYCL);
+    StorageView values(DataType::FLOAT32, Device::SYCL);
+    StorageView indices(DataType::INT32, Device::SYCL);
+    const ops::GumbelMax op(size);
+    op(input, values, indices);
+    return values.to(Device::CPU);
+  };
+
+  const StorageView first_device_0 = sample(0);
+  const StorageView first_device_1 = sample(1);
+  const StorageView second_device_0 = sample(0);
+  const StorageView second_device_1 = sample(1);
+
+  expect_storage_eq(first_device_0, first_device_1);
+  expect_storage_eq(second_device_0, second_device_1);
+  bool sequence_advanced = false;
+  for (dim_t i = 0; i < size; ++i)
+    sequence_advanced |= first_device_0.data<float>()[i] != second_device_0.data<float>()[i];
+  EXPECT_TRUE(sequence_advanced);
+
+  set_device_index(Device::SYCL, initial_device);
+  destroy_context(Device::SYCL);
+  set_random_seed(std::numeric_limits<unsigned int>::max());
+}
+#endif
+
 TEST_P(OpDeviceFPTest, TopPMask) {
   const Device device = GetParam().device;
   const DataType dtype = GetParam().dtype;
@@ -787,6 +868,59 @@ TEST_P(OpDeviceFPTest, TopPMask) {
 
   expect_storage_eq(y.to_float32(), expected, error);
 }
+
+#ifdef CT2_WITH_SYCL
+TEST(SYCLTopPMaskTest, HandlesNaNsAndNegativeInfinities) {
+  if (get_device_count(Device::SYCL) == 0)
+    GTEST_SKIP() << "No SYCL device is available.";
+
+  constexpr float inf = std::numeric_limits<float>::infinity();
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const StorageView input({2, 4},
+                          std::vector<float>{nan, nan, nan, nan,
+                                             -inf, -inf, -inf, -inf},
+                          Device::SYCL);
+  StorageView output(DataType::FLOAT32, Device::SYCL);
+
+  ops::TopPMask(0.9f, -123.f)(input, output);
+
+  const StorageView output_cpu = output.to(Device::CPU);
+  EXPECT_TRUE(std::isnan(output_cpu.data<float>()[0]));
+  EXPECT_FLOAT_EQ(output_cpu.data<float>()[1], -123.f);
+  EXPECT_FLOAT_EQ(output_cpu.data<float>()[2], -123.f);
+  EXPECT_FLOAT_EQ(output_cpu.data<float>()[3], -123.f);
+  EXPECT_FLOAT_EQ(output_cpu.data<float>()[4], -inf);
+  EXPECT_FLOAT_EQ(output_cpu.data<float>()[5], -123.f);
+  EXPECT_FLOAT_EQ(output_cpu.data<float>()[6], -123.f);
+  EXPECT_FLOAT_EQ(output_cpu.data<float>()[7], -123.f);
+}
+
+TEST(SYCLTopPMaskTest, SupportsLargeVocabulary) {
+  if (get_device_count(Device::SYCL) == 0)
+    GTEST_SKIP() << "No SYCL device is available.";
+
+  constexpr dim_t depth = 50000;
+  const StorageView input({1, depth}, std::vector<float>(depth, 0.f), Device::SYCL);
+  StorageView output(DataType::FLOAT32, Device::SYCL);
+
+  ops::TopPMask(0.95f)(input, output);
+
+  const StorageView output_cpu = output.to(Device::CPU);
+  dim_t selected = 0;
+  bool found_mask = false;
+  for (dim_t i = 0; i < depth; ++i) {
+    const bool is_selected = std::isfinite(output_cpu.data<float>()[i]);
+    if (is_selected) {
+      EXPECT_FALSE(found_mask) << "Equal probabilities should be ordered by class index";
+      ++selected;
+    } else {
+      found_mask = true;
+    }
+  }
+  EXPECT_GE(selected, 47000);
+  EXPECT_LE(selected, 48000);
+}
+#endif
 
 TEST_P(OpDeviceFPTest, SoftMax) {
   const Device device = GetParam().device;
@@ -949,7 +1083,7 @@ TEST_P(OpDeviceTest, QuantizeINT8) {
   }
 
   // With rounding before cast and shift to uint8.
-  // Shift to uin8_t is not defined on CUDA
+  // Shift to uint8_t is not defined on CUDA.
   if (device != Device::CUDA) {
     StorageView expected_qa(a.shape(), std::vector<int8_t>{1, 90, -64, -103, -98, -1, 110, -128});
     ops::Quantize(ops::Quantize::ScaleType::GLOBAL, true, true)(a, qa, scale);
@@ -1343,7 +1477,7 @@ TEST_P(OpDeviceFPTest, Conv1DGroupNoBiasQuantized) {
 #endif
     const Device device = GetParam().device;
     if (device != Device::CPU)
-        GTEST_SKIP() << "Grouped quantized convolution is not implemented for CUDA.";
+        GTEST_SKIP() << "Grouped quantized convolution is not implemented for GPU backends.";
     const DataType dtype = GetParam().dtype;
     const float error = std::max(GetParam().error, float(3e-3));
     const StorageView expected({2, 2, 2}, std::vector<float>{
@@ -1441,5 +1575,13 @@ INSTANTIATE_TEST_SUITE_P(CUDA, OpDeviceFPTest,
                          ::testing::Values(FloatType{Device::CUDA, DataType::FLOAT32, 1e-5},
                                            FloatType{Device::CUDA, DataType::FLOAT16, 1e-2},
                                            FloatType{Device::CUDA, DataType::BFLOAT16, 4e-2}),
+                         fp_test_name);
+#endif
+#ifdef CT2_WITH_SYCL
+INSTANTIATE_TEST_SUITE_P(SYCL, OpDeviceTest, ::testing::Values(Device::SYCL));
+INSTANTIATE_TEST_SUITE_P(SYCL, OpDeviceFPTest,
+                         ::testing::Values(FloatType{Device::SYCL, DataType::FLOAT32, 1e-5},
+                                           FloatType{Device::SYCL, DataType::FLOAT16, 1e-2},
+                                           FloatType{Device::SYCL, DataType::BFLOAT16, 4e-2}),
                          fp_test_name);
 #endif

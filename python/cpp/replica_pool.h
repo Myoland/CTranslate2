@@ -131,8 +131,9 @@ namespace ctranslate2 {
           _cached_models.clear();
         loaded_models.clear();
 
-        // We clear the CUDA allocator cache to further reduce the memory after unloading the model.
-        if (_device == Device::CUDA)
+        // Clear the accelerator allocator cache to further reduce memory after
+        // unloading the model.
+        if (_device == Device::CUDA || _device == Device::SYCL)
           _pool->clear_cache();
 
         _model_is_loaded = false;

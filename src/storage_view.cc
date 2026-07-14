@@ -4,6 +4,10 @@
 
 #include "dispatch.h"
 
+#ifdef CT2_WITH_SYCL
+#  include "sycl/utils.h"
+#endif
+
 #define PRINT_MAX_VALUES 6
 
 namespace ctranslate2 {
@@ -368,7 +372,12 @@ namespace ctranslate2 {
 
   StorageView& StorageView::copy_from(const StorageView& other, bool synchronous) {
     resize_as(other);
-    TYPE_DISPATCH(other._dtype, copy_from(other.data<T>(), other._size, other._device, synchronous));
+    TYPE_DISPATCH(other._dtype,
+                  copy_from_device(other.data<T>(),
+                                   other._size,
+                                   other._device,
+                                   synchronous,
+                                   other._device_index));
     return *this;
   }
 
@@ -406,16 +415,64 @@ namespace ctranslate2 {
   }
 
   template <typename T>
-  StorageView& StorageView::copy_from(const T* data, dim_t size, Device device, bool synchronous) {
+  StorageView& StorageView::copy_from(const T* data,
+                                      dim_t size,
+                                      Device device,
+                                      bool synchronous) {
+    return copy_from_device(data,
+                            size,
+                            device,
+                            synchronous,
+                            get_device_index(device));
+  }
+
+  template <typename T>
+  StorageView& StorageView::copy_from_device(const T* data,
+                                             dim_t size,
+                                             Device device,
+                                             bool synchronous,
+                                             int device_index) {
     if (size != _size)
       THROW_INVALID_ARGUMENT("buffer to copy is of size " + std::to_string(size)
                              + " but current storage size is " + std::to_string(_size));
+    if (device_index < 0)
+      device_index = get_device_index(device);
+
+    const ScopedDeviceSetter destination_device_setter(_device, _device_index);
+#ifdef CT2_WITH_SYCL
+    if (device == Device::SYCL && _device == Device::SYCL
+        && device_index != _device_index) {
+      sycl_backend::copy(this->data<T>(),
+                         _device_index,
+                         data,
+                         device_index,
+                         size * sizeof(T),
+                         synchronous);
+      return *this;
+    }
+#endif
 #ifdef CT2_WITH_CUDA
-    if (device != _device) {
+    if ((device == Device::CUDA && _device == Device::CPU)
+        || (device == Device::CPU && _device == Device::CUDA)) {
       if (device == Device::CUDA)
         cross_device_primitives<Device::CUDA, Device::CPU>::copy(data, this->data<T>(), size);
       else
         cross_device_primitives<Device::CPU, Device::CUDA>::copy(data, this->data<T>(), size);
+    } else
+#endif
+#ifdef CT2_WITH_SYCL
+    if ((device == Device::SYCL && _device == Device::CPU)
+        || (device == Device::CPU && _device == Device::SYCL)) {
+      if (device == Device::SYCL) {
+        const ScopedDeviceSetter source_device_setter(device, device_index);
+        cross_device_primitives<Device::SYCL, Device::CPU>::copy(data,
+                                                                 this->data<T>(),
+                                                                 size);
+      } else {
+        cross_device_primitives<Device::CPU, Device::SYCL>::copy(data,
+                                                                 this->data<T>(),
+                                                                 size);
+      }
     } else
 #endif
     {

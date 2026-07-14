@@ -31,7 +31,7 @@ namespace ctranslate2 {
 
     public:
       ComputeTypeResolver(std::string device)
-        : _device(std::move(device)) {
+        : _device(device_to_str(str_to_device(device))) {
       }
 
       ComputeType
@@ -42,6 +42,8 @@ namespace ctranslate2 {
       ComputeType
       operator()(const std::unordered_map<std::string, std::string>& compute_type) const {
         auto it = compute_type.find(_device);
+        if (it == compute_type.end() && _device == "sycl")
+          it = compute_type.find("xpu");
         if (it == compute_type.end())
           return ComputeType::DEFAULT;
         return operator()(it->second);

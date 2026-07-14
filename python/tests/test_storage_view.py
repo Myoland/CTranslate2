@@ -100,6 +100,31 @@ def test_storageview_cuda_to_device():
     assert x.sum() == 2 * cpu_x.sum()
 
 
+@test_utils.require_sycl
+def test_storageview_sycl_to_device():
+    x = np.arange(10, dtype="float32")
+    sycl_x = ctranslate2.StorageView.from_array(x).to_device(
+        ctranslate2.Device.sycl
+    )
+
+    assert sycl_x.device == "sycl"
+    assert sycl_x.device_index == 0
+    assert sycl_x.dtype == ctranslate2.DataType.float32
+    assert sycl_x.shape == [10]
+
+    with pytest.raises(AttributeError, match="SYCL"):
+        sycl_x.__array_interface__
+    with pytest.raises(AttributeError, match="SYCL"):
+        sycl_x.__cuda_array_interface__
+
+    cpu_x = np.array(sycl_x.to_device(ctranslate2.Device.cpu))
+    assert test_utils.array_equal(x, cpu_x)
+
+
+def test_sycl_device_alias():
+    assert ctranslate2.Device.xpu == ctranslate2.Device.sycl
+
+
 def test_storageview_conversion():
     x = np.ones((2, 4), dtype=np.float32)
     s = ctranslate2.StorageView.from_array(x)

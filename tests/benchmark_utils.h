@@ -4,17 +4,12 @@
 #include <iostream>
 #include <vector>
 
-#ifdef CT2_WITH_CUDA
-#ifdef CT2_USE_HIP
-#  include <hip/hip_runtime.h>
-#  define SYNCHRONIZE hipDeviceSynchronize()
-#else
-#  include <cuda_runtime.h>
-#  define SYNCHRONIZE cudaDeviceSynchronize()
-#endif
-#else
-#  define SYNCHRONIZE do {} while (false)
-#endif
+#include "ctranslate2/devices.h"
+
+// Every benchmark function defines a local `device`. Use the public backend
+// synchronization API so asynchronous SYCL submissions are timed as work, not
+// merely as queue submission overhead.
+#define SYNCHRONIZE ctranslate2::synchronize_stream(device)
 
 #define BENCHMARK(fun_call, samples)                                    \
   do {                                                                  \

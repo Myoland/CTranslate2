@@ -5,6 +5,9 @@
 #ifdef CT2_WITH_CUDA
 #  include "./cuda/utils.h"
 #endif
+#ifdef CT2_WITH_SYCL
+#  include "./sycl/utils.h"
+#endif
 
 #include "cpu/backend.h"
 #include "env.h"
@@ -102,6 +105,13 @@ namespace ctranslate2 {
       return false;
 #endif
     }
+    case Device::SYCL:
+#ifdef CT2_WITH_SYCL
+      return sycl_backend::mayiuse_bfloat16(device_index);
+#else
+      (void)device_index;
+      return false;
+#endif
     default:
       return false;
     }
@@ -118,6 +128,13 @@ namespace ctranslate2 {
       return false;
 #endif
     }
+    case Device::SYCL:
+#ifdef CT2_WITH_SYCL
+      return sycl_backend::mayiuse_float16(device_index);
+#else
+      (void)device_index;
+      return false;
+#endif
     default:
       return false;
     }
@@ -137,6 +154,13 @@ namespace ctranslate2 {
     case Device::CUDA:
 #ifdef CT2_WITH_CUDA
       return cuda::gpu_supports_int8(device_index);
+#else
+      (void)device_index;
+      return false;
+#endif
+    case Device::SYCL:
+#ifdef CT2_WITH_SYCL
+      return sycl_backend::mayiuse_int8(device_index);
 #else
       (void)device_index;
       return false;
@@ -192,7 +216,7 @@ namespace ctranslate2 {
         unsupported_compute_type("int16");
       if (device == Device::CPU && support_int8)
         return ComputeType::INT8_FLOAT32;
-      if (device == Device::CUDA && support_float16)
+      if ((device == Device::CUDA || device == Device::SYCL) && support_float16)
         return ComputeType::FLOAT16;
       return ComputeType::FLOAT32;
     }
@@ -233,7 +257,7 @@ namespace ctranslate2 {
         unsupported_compute_type("int8_float32");
       if (device == Device::CPU && support_int16)
         return ComputeType::INT16;
-      if (device == Device::CUDA && support_float16)
+      if ((device == Device::CUDA || device == Device::SYCL) && support_float16)
         return ComputeType::FLOAT16;
       return ComputeType::FLOAT32;
     }
@@ -265,7 +289,7 @@ namespace ctranslate2 {
     }
 
     case ComputeType::AUTO: {
-      if (device == Device::CUDA) {
+      if (device == Device::CUDA || device == Device::SYCL) {
         if (support_int8 && support_float16)
           return ComputeType::INT8_FLOAT16;
         if (support_int8)
@@ -355,9 +379,21 @@ namespace ctranslate2 {
         return 16;
     }
 #else
+    (void)device_index;
+#endif
+
+#ifdef CT2_WITH_SYCL
+    if (device == Device::SYCL) {
+      if (compute_type == ComputeType::FLOAT16 || compute_type == ComputeType::BFLOAT16)
+        return 8;
+      if (compute_type == ComputeType::INT8_FLOAT16
+          || compute_type == ComputeType::INT8_BFLOAT16
+          || compute_type == ComputeType::INT8_FLOAT32)
+        return 16;
+    }
+#else
     (void)compute_type;
     (void)device;
-    (void)device_index;
 #endif
     return 1;
   }

@@ -11,7 +11,16 @@ namespace ctranslate2 {
       const std::string use_mkl_env = read_string_from_env("CT2_USE_MKL");
       if (use_mkl_env.empty()) {
 #ifdef CT2_WITH_MKL
+#  if defined(CT2_WITH_SYCL) \
+    && !defined(CT2_WITH_DNNL) \
+    && !defined(CT2_WITH_OPENBLAS) \
+    && !defined(CT2_WITH_RUY)
+        // A SYCL build requires oneMKL, so use its host backend when there is
+        // no other GEMM backend available on a non-Intel CPU.
+        return true;
+#  else
         return cpu_is_genuine_intel();
+#  endif
 #else
         return false;
 #endif

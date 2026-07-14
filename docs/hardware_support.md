@@ -20,3 +20,7 @@ See the [environment variables](environment_variables.md) `CT2_USE_MKL` and `CT2
 * NVIDIA GPUs with a Compute Capability greater or equal to 3.5
 
 The driver requirement depends on the CUDA version. See the [CUDA Compatibility guide](https://docs.nvidia.com/deploy/cuda-compatibility/index.html) for more information.
+
+Source builds can additionally target Intel Arc, Flex, and Data Center GPUs
+with the Level Zero [SYCL backend](sycl.md). This backend currently requires
+Linux x86-64 and oneAPI 2026.1 or newer.

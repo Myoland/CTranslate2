@@ -160,8 +160,12 @@ namespace ctranslate2 {
 
     Model::~Model() {
       if (!_variable_index.empty()) {
+        // Accelerator kernels can still be using model variables from worker
+        // queues.  Synchronize before releasing the underlying allocation: in
+        // particular, freeing SYCL USM while it is in use is undefined.
+        synchronize_device(_device, _device_index);
         _variable_index.clear();
-        synchronize_device(_device, _device_index);  // Wait for asynchronous deallocations.
+        synchronize_device(_device, _device_index);  // Wait for deferred deallocations.
       }
     }
 
@@ -211,8 +215,9 @@ namespace ctranslate2 {
             if (is_conv) {
               kernel_size = variable.dim(2);
               variable.reshape({variable.dim(0), variable.dim(1) * variable.dim(2)});
-              // For CUDA and DNNL backend, quantized convolution is not supported. Hence, convert to float_dtype.
-              if (device == Device::CUDA
+              // Quantized convolution is not supported by accelerator backends
+              // (or by DNNL). Keep convolution weights in the floating type.
+              if (device == Device::CUDA || device == Device::SYCL
 #ifdef CT2_WITH_DNNL
                 || true
 #endif
@@ -636,6 +641,9 @@ namespace ctranslate2 {
       if (model->config.contains("quantization_type"))
         model->set_quant_method(model->config["quantization_type"]);
 
+      if (device == Device::SYCL && model->quant_method() != QUANTIZATION_TYPE::CT2)
+        throw std::invalid_argument("AWQ quantization is not supported by the SYCL backend");
+
       for (uint32_t i = 0; i < num_variables; ++i) {
         auto name = consume<std::string>(model_file);
         const size_t rank = consume<uint8_t>(model_file);
@@ -780,6 +788,9 @@ namespace ctranslate2 {
       const ScopedDeviceSetter scoped_device_setter(device, device_index);
       model->process_linear_weights();
       model->initialize(model_reader);
+      // Variables may have been converted or packed asynchronously.  Publish
+      // the model to replica worker threads only after these operations finish.
+      synchronize_stream(device);
       return model;
     }
 
@@ -807,6 +818,10 @@ namespace ctranslate2 {
 
       model->_device = device;
       model->_device_index = device_index;
+      if (device != Device::CPU) {
+        ScopedDeviceSetter scoped_device_setter(device, device_index);
+        synchronize_stream(device);
+      }
       return model;
     }
 
@@ -828,13 +843,17 @@ namespace ctranslate2 {
     ModelLoader::load() const {
       if (device_indices.empty())
         throw std::invalid_argument("At least one device index should be set");
+
+      if (tensor_parallel && device != Device::CUDA)
+        throw std::invalid_argument("Tensor Parallel mode can run only on cuda");
+
+      if (device == Device::SYCL && use_flash_attention)
+        throw std::invalid_argument("FlashAttention 2 is not supported by the SYCL backend");
+
 #ifdef CT2_WITH_CUDA
       if (device == Device::CUDA && !cuda::have_same_compute_capability(device_indices))
         throw std::invalid_argument("Cannot use multiple GPUs with different Compute Capabilities "
                                     "for the same model");
-      if (tensor_parallel && device != Device::CUDA) {
-        throw std::invalid_argument("Tensor Parallel mode can run only on cuda");
-      }
       if (tensor_parallel && (device_indices.size() > 1)) {
         spdlog::warn("Running model in mode tensor parallel does not support"
                      " running independently a model in each device");

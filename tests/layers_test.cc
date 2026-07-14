@@ -268,3 +268,10 @@ INSTANTIATE_TEST_SUITE_P(CUDA, LayerDeviceFPTest,
                                            FloatType{Device::CUDA, DataType::BFLOAT16, 1e-2}),
                          fp_test_name);
 #endif
+#ifdef CT2_WITH_SYCL
+INSTANTIATE_TEST_SUITE_P(SYCL, LayerDeviceFPTest,
+                         ::testing::Values(FloatType{Device::SYCL, DataType::FLOAT32, 1e-5},
+                                           FloatType{Device::SYCL, DataType::FLOAT16, 1e-2},
+                                           FloatType{Device::SYCL, DataType::BFLOAT16, 1e-2}),
+                         fp_test_name);
+#endif

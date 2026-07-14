@@ -31,6 +31,7 @@ The documentation includes installation instructions, usage guides, and API refe
    parallel.md
    memory.md
    performance.md
+   sycl.md
    environment_variables.md
 
 .. toctree::
