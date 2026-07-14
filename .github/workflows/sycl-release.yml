@@ -13,10 +13,10 @@ on:
       - "LICENSE"
       - "cli/**"
       - "cmake/**"
-      - "docs/sycl.md"
       - "include/**"
       - "python/**"
       - "src/**"
+      - "tests/**"
       - "third_party/**"
   pull_request:
     branches:
@@ -27,10 +27,10 @@ on:
       - "LICENSE"
       - "cli/**"
       - "cmake/**"
-      - "docs/sycl.md"
       - "include/**"
       - "python/**"
       - "src/**"
+      - "tests/**"
       - "third_party/**"
 
 concurrency:
@@ -66,6 +66,12 @@ jobs:
             ninja-build \
             zip
           sudo apt-get clean
+
+      - name: Set up Python 3.9
+        id: python39
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
 
       - name: Set up Python 3.10
         id: python310
@@ -144,11 +150,12 @@ jobs:
           export LD_LIBRARY_PATH="$PWD/install-sycl/lib:${LD_LIBRARY_PATH:-}"
           export CT2_USE_MKL=1
           build-sycl-release/tests/ctranslate2_test tests/data \
-            --gtest_filter='-*ModelVariantTest*:*SearchVariantTest*:*TranslatorTest*:*BufferedTranslationWrapperTest*'
+            --gtest_filter='-*SYCL*:*ModelVariantTest*:*SearchVariantTest*:*TranslatorTest*:*BufferedTranslationWrapperTest*'
 
       - name: Build Python wheels
         shell: bash
         env:
+          PYTHON_39: ${{ steps.python39.outputs.python-path }}
           PYTHON_310: ${{ steps.python310.outputs.python-path }}
           PYTHON_311: ${{ steps.python311.outputs.python-path }}
           PYTHON_312: ${{ steps.python312.outputs.python-path }}
@@ -159,6 +166,7 @@ jobs:
           source /opt/intel/oneapi/setvars.sh
           mkdir -p release/wheels
           for python in \
+            "$PYTHON_39" \
             "$PYTHON_310" \
             "$PYTHON_311" \
             "$PYTHON_312" \
@@ -170,7 +178,7 @@ jobs:
             CTRANSLATE2_ROOT="$PWD/install-sycl" CXX=icpx \
               "$python" -m build --wheel --outdir "$PWD/release/wheels" python
           done
-          test "$(find release/wheels -maxdepth 1 -name '*.whl' | wc -l)" -eq 5
+          test "$(find release/wheels -maxdepth 1 -name '*.whl' | wc -l)" -eq 6
 
       - name: Test the Python wheel
         shell: bash
@@ -181,9 +189,15 @@ jobs:
           source /opt/intel/oneapi/setvars.sh
           "$PYTHON_312" -m venv "$RUNNER_TEMP/ctranslate2-sycl-smoke"
           source "$RUNNER_TEMP/ctranslate2-sycl-smoke/bin/activate"
-          python -m pip install --disable-pip-version-check numpy pyyaml
+          python -m pip install --disable-pip-version-check numpy pyyaml twine
+          python -m twine check release/wheels/*.whl
           python -m pip install --no-deps release/wheels/*cp312*.whl
           export LD_LIBRARY_PATH="$PWD/install-sycl/lib:${LD_LIBRARY_PATH:-}"
+          extension=$(python -c 'import ctranslate2._ext as ext; print(ext.__file__)')
+          ldd "$extension" | tee python-dependencies.txt
+          if grep -q "not found" python-dependencies.txt; then
+            exit 1
+          fi
           python - <<'PY'
           import numpy as np
           import ctranslate2
@@ -200,31 +214,75 @@ jobs:
         shell: bash
         run: |
           version=$(sed -n 's/^__version__ = "\([^"]*\)"/\1/p' python/ctranslate2/version.py)
-          bundle="ctranslate2-sycl-${version}-linux-x86_64"
+          test -n "$version"
+          bundle="ctranslate2-sycl-${version}-ubuntu-24.04-x86_64"
           mkdir -p "release/staging/$bundle"
           cp -a install-sycl/. "release/staging/$bundle/"
           mkdir -p "release/staging/$bundle/wheels"
           cp release/wheels/*.whl "release/staging/$bundle/wheels/"
-          cp docs/sycl.md "release/staging/$bundle/README-SYCL.md"
           cp LICENSE "release/staging/$bundle/"
+          # The runtime variables below should remain literal in INSTALL.txt.
+          # shellcheck disable=SC2016
+          printf '%s\n' \
+            'CTranslate2 Intel SYCL release bundle for Ubuntu 24.04 x86-64' \
+            '' \
+            '1. Install the Intel Level Zero GPU driver and oneAPI 2026.1 runtime.' \
+            '2. Extract this complete bundle and enter its top-level directory.' \
+            '3. Install Python dependencies and the matching bundled wheel:' \
+            '     python -m pip install numpy pyyaml' \
+            '     python -m pip install --no-deps --no-index --find-links=wheels ctranslate2' \
+            '4. Configure oneAPI and the companion native library:' \
+            '     source /opt/intel/oneapi/setvars.sh' \
+            '     export LD_LIBRARY_PATH="$PWD/lib:${LD_LIBRARY_PATH:-}"' \
+            '     export ONEAPI_DEVICE_SELECTOR=level_zero:gpu' \
+            '' \
+            'Keep the lib directory with the installed wheel. Driver and source-build' \
+            'reference: https://github.com/Myoland/CTranslate2/blob/master/docs/sycl.md' \
+            > "release/staging/$bundle/INSTALL.txt"
           (
             cd release/staging
-            zip -qry "../sycl-python-wheels-Linux.zip" "$bundle"
+            zip -qry "../sycl-python-wheels-Ubuntu-24.04.zip" "$bundle"
           )
-          unzip -t release/sycl-python-wheels-Linux.zip
+          unzip -t release/sycl-python-wheels-Ubuntu-24.04.zip
           (
             cd release
-            sha256sum sycl-python-wheels-Linux.zip \
-              > sycl-python-wheels-Linux.zip.sha256
+            sha256sum sycl-python-wheels-Ubuntu-24.04.zip \
+              > sycl-python-wheels-Ubuntu-24.04.zip.sha256
           )
+
+      - name: Test the assembled release bundle
+        shell: bash
+        env:
+          PYTHON_312: ${{ steps.python312.outputs.python-path }}
+        run: |
+          unzip -q release/sycl-python-wheels-Ubuntu-24.04.zip \
+            -d "$RUNNER_TEMP/ctranslate2-sycl-bundle"
+          bundle=$(find "$RUNNER_TEMP/ctranslate2-sycl-bundle" \
+            -mindepth 1 -maxdepth 1 -type d -print -quit)
+          test -n "$bundle"
+          "$PYTHON_312" -m venv "$RUNNER_TEMP/ctranslate2-sycl-bundle-smoke"
+          source "$RUNNER_TEMP/ctranslate2-sycl-bundle-smoke/bin/activate"
+          python -m pip install --disable-pip-version-check numpy pyyaml
+          python -m pip install --no-deps --no-index \
+            --find-links="$bundle/wheels" ctranslate2
+          # shellcheck source=/dev/null
+          source /opt/intel/oneapi/setvars.sh
+          export LD_LIBRARY_PATH="$bundle/lib:${LD_LIBRARY_PATH:-}"
+          python - <<'PY'
+          import ctranslate2
+
+          assert ctranslate2.Device.xpu == ctranslate2.Device.sycl
+          print("CTranslate2", ctranslate2.__version__)
+          print("SYCL devices visible on the hosted runner:", ctranslate2.get_sycl_device_count())
+          PY
 
       - name: Upload the SYCL bundle
         uses: actions/upload-artifact@v4
         with:
-          name: sycl-python-wheels-Linux
+          name: sycl-python-wheels-Ubuntu-24.04
           path: |
-            release/sycl-python-wheels-Linux.zip
-            release/sycl-python-wheels-Linux.zip.sha256
+            release/sycl-python-wheels-Ubuntu-24.04.zip
+            release/sycl-python-wheels-Ubuntu-24.04.zip.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -240,12 +298,12 @@ jobs:
       - name: Download the SYCL bundle
         uses: actions/download-artifact@v4
         with:
-          name: sycl-python-wheels-Linux
+          name: sycl-python-wheels-Ubuntu-24.04
           path: release
 
       - name: Create or update the GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/sycl-python-wheels-Linux.zip
-            release/sycl-python-wheels-Linux.zip.sha256
+            release/sycl-python-wheels-Ubuntu-24.04.zip
+            release/sycl-python-wheels-Ubuntu-24.04.zip.sha256
