@@ -1,0 +1,251 @@
+name: SYCL CI and release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+    paths:
+      - ".github/workflows/sycl-release.yml"
+      - "CMakeLists.txt"
+      - "LICENSE"
+      - "cli/**"
+      - "cmake/**"
+      - "docs/sycl.md"
+      - "include/**"
+      - "python/**"
+      - "src/**"
+      - "third_party/**"
+  pull_request:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/sycl-release.yml"
+      - "CMakeLists.txt"
+      - "LICENSE"
+      - "cli/**"
+      - "cmake/**"
+      - "docs/sycl.md"
+      - "include/**"
+      - "python/**"
+      - "src/**"
+      - "third_party/**"
+
+concurrency:
+  group: sycl-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  build-sycl-release:
+    name: Build portable Linux x86-64 bundle
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Add the Intel oneAPI repository
+        run: |
+          wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt-get update
+
+      - name: Install the Intel SYCL toolchain
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            intel-oneapi-compiler-dpcpp-cpp-2026.1 \
+            intel-oneapi-mkl-devel-2026.1 \
+            ninja-build \
+            zip
+          sudo apt-get clean
+
+      - name: Set up Python 3.10
+        id: python310
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Set up Python 3.11
+        id: python311
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Python 3.12
+        id: python312
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Python 3.13
+        id: python313
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Python 3.14
+        id: python314
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Build the portable SYCL library
+        shell: bash
+        run: |
+          # shellcheck source=/dev/null
+          source /opt/intel/oneapi/setvars.sh
+          cmake -S . -B build-sycl-release -G Ninja \
+            -DCMAKE_C_COMPILER=icx \
+            -DCMAKE_CXX_COMPILER=icpx \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/install-sycl" \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_CLI=ON \
+            -DBUILD_TESTS=ON \
+            -DWITH_SYCL=ON \
+            -DSYCL_TARGETS=spir64 \
+            -DWITH_CUDA=OFF \
+            -DWITH_CUDNN=OFF \
+            -DWITH_HIP=OFF \
+            -DWITH_MKL=ON \
+            -DOPENMP_RUNTIME=INTEL
+          cmake --build build-sycl-release --parallel 2
+          cmake --install build-sycl-release
+
+      - name: Verify the native library
+        shell: bash
+        run: |
+          # shellcheck source=/dev/null
+          source /opt/intel/oneapi/setvars.sh
+          library=$(readlink -f install-sycl/lib/libctranslate2.so)
+          "$CMPLR_ROOT/bin/compiler/clang-offload-bundler" \
+            -type=o -input="$library" -list | tee sycl-targets.txt
+          grep -Fxq sycl-spir64 sycl-targets.txt
+          LD_LIBRARY_PATH="$PWD/install-sycl/lib:${LD_LIBRARY_PATH:-}" \
+            ldd "$library" | tee native-dependencies.txt
+          if grep -q "not found" native-dependencies.txt; then
+            exit 1
+          fi
+
+      - name: Run CPU tests from the SYCL build
+        shell: bash
+        run: |
+          # shellcheck source=/dev/null
+          source /opt/intel/oneapi/setvars.sh
+          export LD_LIBRARY_PATH="$PWD/install-sycl/lib:${LD_LIBRARY_PATH:-}"
+          export CT2_USE_MKL=1
+          build-sycl-release/tests/ctranslate2_test tests/data \
+            --gtest_filter='-*ModelVariantTest*:*SearchVariantTest*:*TranslatorTest*:*BufferedTranslationWrapperTest*'
+
+      - name: Build Python wheels
+        shell: bash
+        env:
+          PYTHON_310: ${{ steps.python310.outputs.python-path }}
+          PYTHON_311: ${{ steps.python311.outputs.python-path }}
+          PYTHON_312: ${{ steps.python312.outputs.python-path }}
+          PYTHON_313: ${{ steps.python313.outputs.python-path }}
+          PYTHON_314: ${{ steps.python314.outputs.python-path }}
+        run: |
+          # shellcheck source=/dev/null
+          source /opt/intel/oneapi/setvars.sh
+          mkdir -p release/wheels
+          for python in \
+            "$PYTHON_310" \
+            "$PYTHON_311" \
+            "$PYTHON_312" \
+            "$PYTHON_313" \
+            "$PYTHON_314"
+          do
+            "$python" -m pip install --disable-pip-version-check build
+            rm -rf python/build python/*.egg-info
+            CTRANSLATE2_ROOT="$PWD/install-sycl" CXX=icpx \
+              "$python" -m build --wheel --outdir "$PWD/release/wheels" python
+          done
+          test "$(find release/wheels -maxdepth 1 -name '*.whl' | wc -l)" -eq 5
+
+      - name: Test the Python wheel
+        shell: bash
+        env:
+          PYTHON_312: ${{ steps.python312.outputs.python-path }}
+        run: |
+          # shellcheck source=/dev/null
+          source /opt/intel/oneapi/setvars.sh
+          "$PYTHON_312" -m venv "$RUNNER_TEMP/ctranslate2-sycl-smoke"
+          source "$RUNNER_TEMP/ctranslate2-sycl-smoke/bin/activate"
+          python -m pip install --disable-pip-version-check numpy pyyaml
+          python -m pip install --no-deps release/wheels/*cp312*.whl
+          export LD_LIBRARY_PATH="$PWD/install-sycl/lib:${LD_LIBRARY_PATH:-}"
+          python - <<'PY'
+          import numpy as np
+          import ctranslate2
+
+          values = np.arange(8, dtype=np.float32)
+          view = ctranslate2.StorageView.from_array(values)
+          np.testing.assert_array_equal(np.array(view), values)
+          assert ctranslate2.Device.xpu == ctranslate2.Device.sycl
+          print("CTranslate2", ctranslate2.__version__)
+          print("SYCL devices visible on the hosted runner:", ctranslate2.get_sycl_device_count())
+          PY
+
+      - name: Assemble the release bundle
+        shell: bash
+        run: |
+          version=$(sed -n 's/^__version__ = "\([^"]*\)"/\1/p' python/ctranslate2/version.py)
+          bundle="ctranslate2-sycl-${version}-linux-x86_64"
+          mkdir -p "release/staging/$bundle"
+          cp -a install-sycl/. "release/staging/$bundle/"
+          mkdir -p "release/staging/$bundle/wheels"
+          cp release/wheels/*.whl "release/staging/$bundle/wheels/"
+          cp docs/sycl.md "release/staging/$bundle/README-SYCL.md"
+          cp LICENSE "release/staging/$bundle/"
+          (
+            cd release/staging
+            zip -qry "../sycl-python-wheels-Linux.zip" "$bundle"
+          )
+          unzip -t release/sycl-python-wheels-Linux.zip
+          (
+            cd release
+            sha256sum sycl-python-wheels-Linux.zip \
+              > sycl-python-wheels-Linux.zip.sha256
+          )
+
+      - name: Upload the SYCL bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: sycl-python-wheels-Linux
+          path: |
+            release/sycl-python-wheels-Linux.zip
+            release/sycl-python-wheels-Linux.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-sycl-release:
+    name: Attach bundle to the GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build-sycl-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the SYCL bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: sycl-python-wheels-Linux
+          path: release
+
+      - name: Create or update the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/sycl-python-wheels-Linux.zip
+            release/sycl-python-wheels-Linux.zip.sha256
