@@ -103,9 +103,7 @@ def test_storageview_cuda_to_device():
 @test_utils.require_sycl
 def test_storageview_sycl_to_device():
     x = np.arange(10, dtype="float32")
-    sycl_x = ctranslate2.StorageView.from_array(x).to_device(
-        ctranslate2.Device.sycl
-    )
+    sycl_x = ctranslate2.StorageView.from_array(x).to_device(ctranslate2.Device.sycl)
 
     assert sycl_x.device == "sycl"
     assert sycl_x.device_index == 0

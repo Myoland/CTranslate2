@@ -40,8 +40,8 @@ try:
         Translator,
         contains_model,
         get_cuda_device_count,
-        get_sycl_device_count,
         get_supported_compute_types,
+        get_sycl_device_count,
         get_xpu_device_count,
         set_random_seed,
     )
