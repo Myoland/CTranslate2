@@ -16,7 +16,14 @@ namespace ctranslate2 {
       namespace matrix = ::sycl::ext::oneapi::experimental::matrix;
       namespace intel_matrix = ::sycl::ext::intel::experimental::matrix;
 
-      constexpr dim_t projection_rows = 5;
+      // faster-whisper expands each audio chunk by the beam size before the
+      // iterative decoder starts.  With its usual beam size of 5, a batched
+      // request therefore reaches this projection with 5 * batch_size rows.
+      // Batches are also compacted as individual chunks finish, so accept all
+      // row counts through the measured B580 profitability boundary instead
+      // of a few exact multiples of 5. The crossover with oneMKL is between
+      // 80 and 96 rows, so batch 16 with beam size 5 remains fused.
+      constexpr dim_t max_projection_rows = 80;
       constexpr dim_t projection_input_size = 1280;
       constexpr dim_t projection_output_size = 3840;
       constexpr dim_t projection_part_size = projection_output_size / 3;
@@ -69,7 +76,8 @@ namespace ctranslate2 {
     bool supports_fused_qkv_projection_fp16(
       const FusedQKVProjectionFP16Config& config,
       int device_index) {
-      if (config.rows != projection_rows
+      if (config.rows <= 0
+          || config.rows > max_projection_rows
           || config.input_size != projection_input_size
           || config.output_size != projection_output_size)
         return false;
@@ -87,7 +95,8 @@ namespace ctranslate2 {
       if (input.device() != Device::SYCL
           || input.dtype() != DataType::FLOAT16
           || input.rank() != 3
-          || input.dim(0) != projection_rows
+          || input.dim(0) <= 0
+          || input.dim(0) > max_projection_rows
           || input.dim(1) != 1
           || input.dim(2) != projection_input_size
           || weight.device() != input.device()
@@ -110,6 +119,7 @@ namespace ctranslate2 {
           || output3.dtype() != input.dtype())
         return false;
 
+      const dim_t projection_rows = input.dim(0);
       const FusedQKVProjectionFP16Config config{
         projection_rows, projection_input_size, projection_output_size};
       if (!supports_fused_qkv_projection_fp16(config, input.device_index()))
@@ -135,18 +145,24 @@ namespace ctranslate2 {
           || !is_aligned(device_output3))
         return false;
 
+      const size_t row_tiles
+        = (static_cast<size_t>(projection_rows) + matrix_tile_size - 1)
+          / matrix_tile_size;
+      const size_t column_tiles = projection_output_size / matrix_tile_size;
       get_queue(input.device_index()).submit([&](::sycl::handler& handler) {
         ::sycl::local_accessor<::sycl::half, 1> tile_storage(
           matrix_tile_size * matrix_tile_size, handler);
         handler.parallel_for<FusedQKVProjectionFP16Kernel>(
           ::sycl::nd_range<1>(
-            ::sycl::range<1>((projection_output_size / matrix_tile_size)
+            ::sycl::range<1>(row_tiles * column_tiles
                              * matrix_subgroup_size),
             ::sycl::range<1>(matrix_subgroup_size)),
           [=](::sycl::nd_item<1> item)
             [[sycl::reqd_sub_group_size(matrix_subgroup_size)]] {
           const auto subgroup = item.get_sub_group();
-          const size_t column_tile = item.get_group(0);
+          const size_t row_tile = item.get_group(0) / column_tiles;
+          const size_t column_tile = item.get_group(0) % column_tiles;
+          const size_t global_row = row_tile * matrix_tile_size;
           const size_t global_column = column_tile * matrix_tile_size;
 
           const auto global_input = ::sycl::address_space_cast<
@@ -175,15 +191,15 @@ namespace ctranslate2 {
                                matrix_tile_size> tile_c;
           matrix::joint_matrix_fill(subgroup, tile_c, ::sycl::half(0));
           for (size_t k = 0; k < projection_input_size; k += matrix_tile_size) {
-            // The allocation contains only 5 rows. Checked load zero-fills the
-            // other 11 tile rows without reading beyond input.size().
+            // The final row tile can be partial. Checked load zero-fills its
+            // remaining rows without reading beyond input.size().
             intel_matrix::joint_matrix_load_checked(subgroup,
                                                      tile_a,
                                                      global_input,
                                                      projection_input_size,
                                                      projection_rows,
                                                      projection_input_size,
-                                                     0,
+                                                     global_row,
                                                      k);
             matrix::joint_matrix_load(
               subgroup,
@@ -210,10 +226,14 @@ namespace ctranslate2 {
           const size_t local_column = item.get_local_id(0);
           const ::sycl::half column_bias
             = device_bias[global_column + local_column];
-          for (size_t row = 0; row < projection_rows; ++row) {
+          const size_t rows_in_tile
+            = ::sycl::min(matrix_tile_size,
+                          static_cast<size_t>(projection_rows) - global_row);
+          for (size_t row = 0; row < rows_in_tile; ++row) {
             const ::sycl::half element
               = tile_storage[row * matrix_tile_size + local_column];
-            output[row * projection_part_size + part_column + local_column]
+            output[(global_row + row) * projection_part_size
+                   + part_column + local_column]
               = ::sycl::half(static_cast<float>(element)
                              + static_cast<float>(column_bias));
           }

@@ -12,8 +12,9 @@ namespace ctranslate2 {
     };
 
     // This predicate is intentionally narrow: the kernel relies on the B580
-    // 16x16 FP16 accumulator lane layout and is only profitable for Whisper's
-    // iterative self-attention projection.
+    // 16x16 FP16 accumulator lane layout and is only enabled for up to 80 rows
+    // of Whisper's iterative self-attention projection. This is the measured
+    // B580 profitability boundary and covers batch 16 with beam size 5.
     bool supports_fused_qkv_projection_fp16(
       const FusedQKVProjectionFP16Config& config,
       int device_index = -1);

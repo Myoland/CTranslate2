@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include "test_utils.h"
 #include "ctranslate2/layers/attention.h"
@@ -1126,6 +1127,71 @@ TEST_P(OpDeviceFPTest, MaskedSoftMax) {
   ops::SoftMax()(x.to(dtype), lengths, y);
   expect_storage_eq(y.to_float32(), expected, error);
 }
+
+#ifdef CT2_WITH_SYCL
+TEST(SYCLSoftMaxTest, LargeDepthFloat16) {
+  if (get_device_count(Device::SYCL) == 0
+      || !mayiuse_float16(Device::SYCL))
+    GTEST_SKIP() << "No FP16-capable SYCL device is available";
+
+  constexpr dim_t rows = 6;
+  constexpr dim_t depth = 1500;
+  const std::vector<int32_t> length_values{
+    int32_t(depth), 977, 1, 0, int32_t(depth + 100), -7};
+  std::vector<float> values(rows * depth);
+  for (dim_t i = 0; i < rows * depth; ++i) {
+    const int centered = static_cast<int>(i % 17) - 8;
+    values[i] = 3.f * std::sin(float(i) * 0.013f)
+                + 0.01f * float(centered);
+  }
+
+  const StorageView input_cpu
+    = StorageView({rows, depth}, values).to(DataType::FLOAT16);
+  const StorageView input = input_cpu.to(Device::SYCL);
+  const StorageView lengths({rows}, length_values, Device::SYCL);
+  StorageView output(DataType::FLOAT16, Device::SYCL);
+  ops::SoftMax()(input, lengths, output);
+
+  StorageView in_place
+    = StorageView({rows, depth}, values)
+        .to(DataType::FLOAT16).to(Device::SYCL);
+  ops::SoftMax()(in_place, lengths, in_place);
+  expect_storage_eq(output, in_place);
+
+  const StorageView rounded_input = input_cpu.to_float32();
+  const StorageView output_float = output.to(Device::CPU).to_float32();
+  for (dim_t row = 0; row < rows; ++row) {
+    const dim_t active = std::max<dim_t>(
+      0, std::min<dim_t>(length_values[row], depth));
+    float maximum = -std::numeric_limits<float>::infinity();
+    for (dim_t i = 0; i < active; ++i) {
+      maximum = std::fmax(maximum,
+                          rounded_input.at<float>({row, i}));
+    }
+    float denominator = 0.f;
+    for (dim_t i = 0; i < active; ++i)
+      denominator += std::exp(rounded_input.at<float>({row, i}) - maximum);
+
+    float probability_sum = 0.f;
+    for (dim_t i = 0; i < depth; ++i) {
+      const float actual = output_float.at<float>({row, i});
+      if (i < active) {
+        const float expected
+          = std::exp(rounded_input.at<float>({row, i}) - maximum)
+            / denominator;
+        EXPECT_NEAR(actual, expected, 1e-3f);
+        probability_sum += actual;
+      } else {
+        EXPECT_FLOAT_EQ(actual, 0.f);
+      }
+    }
+    if (active > 0)
+      EXPECT_NEAR(probability_sum, 1.f, 1e-2f);
+    else
+      EXPECT_FLOAT_EQ(probability_sum, 0.f);
+  }
+}
+#endif
 
 TEST_P(OpDeviceFPTest, MaskedSoftMaxTriangular) {
   const Device device = GetParam().device;

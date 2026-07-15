@@ -10,6 +10,7 @@
 namespace {
 
   constexpr dim_t rows = 5;
+  constexpr dim_t max_rows = 80;
   constexpr dim_t input_size = 1280;
   constexpr dim_t output_size = 3840;
 
@@ -33,17 +34,25 @@ TEST(SYCLFusedQKVProjectionTest, DispatchPredicateIsStrict) {
   const bool exact_shape_supported
     = sycl_backend::supports_fused_qkv_projection_fp16(config);
 
-  ++config.rows;
+  config.rows = 0;
   EXPECT_FALSE(sycl_backend::supports_fused_qkv_projection_fp16(config));
-  --config.rows;
+  config.rows = max_rows + 1;
+  EXPECT_FALSE(sycl_backend::supports_fused_qkv_projection_fp16(config));
+  config.rows = rows;
   ++config.input_size;
   EXPECT_FALSE(sycl_backend::supports_fused_qkv_projection_fp16(config));
   --config.input_size;
   ++config.output_size;
   EXPECT_FALSE(sycl_backend::supports_fused_qkv_projection_fp16(config));
+  --config.output_size;
 
   if (!exact_shape_supported)
     GTEST_SKIP() << "The exact-shape kernel is intentionally disabled on this device";
+
+  for (const dim_t supported_rows : {1, 5, 10, 16, 20, 35, 40, 64, 80}) {
+    config.rows = supported_rows;
+    EXPECT_TRUE(sycl_backend::supports_fused_qkv_projection_fp16(config));
+  }
 }
 
 TEST(SYCLFusedQKVProjectionTest, MatchesOneMKLBiasAndSplit) {
@@ -53,19 +62,13 @@ TEST(SYCLFusedQKVProjectionTest, MatchesOneMKLBiasAndSplit) {
   std::mt19937 generator(123);
   std::uniform_real_distribution<float> value_distribution(-0.05f, 0.05f);
   std::uniform_real_distribution<float> bias_distribution(-0.01f, 0.01f);
-  std::vector<float> input_values(rows * input_size);
   std::vector<float> weight_values(output_size * input_size);
   std::vector<float> bias_values(output_size);
-  for (float& value : input_values)
-    value = value_distribution(generator);
   for (float& value : weight_values)
     value = value_distribution(generator);
   for (float& value : bias_values)
     value = bias_distribution(generator);
 
-  const StorageView input
-    = StorageView({rows, 1, input_size}, input_values)
-        .to(DataType::FLOAT16).to(Device::SYCL);
   const StorageView weight
     = StorageView({output_size, input_size}, weight_values)
         .to(DataType::FLOAT16).to(Device::SYCL);
@@ -73,22 +76,32 @@ TEST(SYCLFusedQKVProjectionTest, MatchesOneMKLBiasAndSplit) {
     = StorageView({output_size}, bias_values)
         .to(DataType::FLOAT16).to(Device::SYCL);
 
-  StorageView projection(DataType::FLOAT16, Device::SYCL);
-  ops::Gemm(/*alpha=*/1, /*beta=*/0, /*trans_a=*/false, /*trans_b=*/true)(
-    input, weight, projection);
-  StorageView expected1(DataType::FLOAT16, Device::SYCL);
-  StorageView expected2(DataType::FLOAT16, Device::SYCL);
-  StorageView expected3(DataType::FLOAT16, Device::SYCL);
-  ops::BiasAdd().split3(
-    projection, bias, expected1, expected2, expected3);
+  for (const dim_t test_rows : {1, 5, 10, 16, 17, 20, 35, 40, 64, 80}) {
+    SCOPED_TRACE(test_rows);
+    std::vector<float> input_values(test_rows * input_size);
+    for (float& value : input_values)
+      value = value_distribution(generator);
+    const StorageView input
+      = StorageView({test_rows, 1, input_size}, input_values)
+          .to(DataType::FLOAT16).to(Device::SYCL);
 
-  StorageView output1(DataType::FLOAT16, Device::SYCL);
-  StorageView output2(DataType::FLOAT16, Device::SYCL);
-  StorageView output3(DataType::FLOAT16, Device::SYCL);
-  ASSERT_TRUE(sycl_backend::fused_qkv_projection_fp16(
-    input, weight, bias, output1, output2, output3));
+    StorageView projection(DataType::FLOAT16, Device::SYCL);
+    ops::Gemm(/*alpha=*/1, /*beta=*/0, /*trans_a=*/false, /*trans_b=*/true)(
+      input, weight, projection);
+    StorageView expected1(DataType::FLOAT16, Device::SYCL);
+    StorageView expected2(DataType::FLOAT16, Device::SYCL);
+    StorageView expected3(DataType::FLOAT16, Device::SYCL);
+    ops::BiasAdd().split3(
+      projection, bias, expected1, expected2, expected3);
 
-  expect_storage_eq(output1.to_float32(), expected1.to_float32(), 5e-4f);
-  expect_storage_eq(output2.to_float32(), expected2.to_float32(), 5e-4f);
-  expect_storage_eq(output3.to_float32(), expected3.to_float32(), 5e-4f);
+    StorageView output1(DataType::FLOAT16, Device::SYCL);
+    StorageView output2(DataType::FLOAT16, Device::SYCL);
+    StorageView output3(DataType::FLOAT16, Device::SYCL);
+    ASSERT_TRUE(sycl_backend::fused_qkv_projection_fp16(
+      input, weight, bias, output1, output2, output3));
+
+    expect_storage_eq(output1.to_float32(), expected1.to_float32(), 5e-4f);
+    expect_storage_eq(output2.to_float32(), expected2.to_float32(), 5e-4f);
+    expect_storage_eq(output3.to_float32(), expected3.to_float32(), 5e-4f);
+  }
 }

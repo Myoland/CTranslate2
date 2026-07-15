@@ -1,6 +1,7 @@
 #include "test_utils.h"
 
 #include <cmath>
+#include <utility>
 #include <vector>
 
 #include "ctranslate2/ops/matmul.h"
@@ -9,7 +10,7 @@
 
 namespace {
 
-  constexpr dim_t batch_size = 5;
+  constexpr dim_t default_batch_size = 5;
   constexpr dim_t num_heads = 20;
   constexpr dim_t head_dim = 64;
   constexpr float query_scale = 0.125f;
@@ -24,7 +25,17 @@ namespace {
     return values;
   }
 
-  void test_fused_attention(const dim_t key_length) {
+  bool supports_fused_attention(const dim_t batch_size,
+                                const dim_t key_length) {
+    if (get_device_count(Device::SYCL) == 0
+        || !mayiuse_float16(Device::SYCL))
+      return false;
+    const sycl_backend::FusedSingleQueryAttentionFP16Config config{
+      batch_size, num_heads, 1, key_length, head_dim};
+    return sycl_backend::supports_fused_single_query_attention_fp16(config);
+  }
+
+  void test_fused_attention(const dim_t batch_size, const dim_t key_length) {
     if (get_device_count(Device::SYCL) == 0
         || !mayiuse_float16(Device::SYCL))
       GTEST_SKIP() << "No FP16-capable SYCL device is available";
@@ -71,15 +82,39 @@ namespace {
 }
 
 TEST(SYCLFusedAttentionTest, MatchesUnfusedPathAtK32) {
-  test_fused_attention(32);
+  test_fused_attention(default_batch_size, 32);
+  if (!supports_fused_attention(1, 32))
+    GTEST_SKIP() << "The expanded batched kernel is B580-specific";
+  for (const dim_t batch_size : {1, 10, 20})
+    test_fused_attention(batch_size, 32);
+}
+
+TEST(SYCLFusedAttentionTest, MatchesUnfusedPathAtK64) {
+  if (!supports_fused_attention(11, 64))
+    GTEST_SKIP() << "The expanded batched kernel is B580-specific";
+  for (const dim_t batch_size : {11, 20})
+    test_fused_attention(batch_size, 64);
+}
+
+TEST(SYCLFusedAttentionTest, MatchesUnfusedPathAtK16) {
+  if (!supports_fused_attention(40, 16))
+    GTEST_SKIP() << "The expanded batched kernel is B580-specific";
+  for (const dim_t batch_size : {40, 64})
+    test_fused_attention(batch_size, 16);
 }
 
 TEST(SYCLFusedAttentionTest, MatchesUnfusedPathAtK128) {
-  test_fused_attention(128);
+  test_fused_attention(default_batch_size, 128);
+}
+
+TEST(SYCLFusedAttentionTest, MatchesBatchedUnfusedPathAtK128) {
+  if (!supports_fused_attention(10, 128))
+    GTEST_SKIP() << "The expanded batched kernel is B580-specific";
+  test_fused_attention(10, 128);
 }
 
 TEST(SYCLFusedAttentionTest, MatchesUnfusedPathAtK320) {
-  test_fused_attention(320);
+  test_fused_attention(default_batch_size, 320);
 }
 
 TEST(SYCLFusedAttentionTest, DispatchPredicateIsStrict) {
@@ -88,8 +123,34 @@ TEST(SYCLFusedAttentionTest, DispatchPredicateIsStrict) {
     GTEST_SKIP() << "No FP16-capable SYCL device is available";
 
   sycl_backend::FusedSingleQueryAttentionFP16Config config{
-    batch_size, num_heads, 1, 32, head_dim};
+    default_batch_size, num_heads, 1, 16, head_dim};
   EXPECT_TRUE(sycl_backend::supports_fused_single_query_attention_fp16(config));
+
+  config.batch_size = 6;
+  const bool supports_batched
+    = sycl_backend::supports_fused_single_query_attention_fp16(config);
+  for (const dim_t batch_size : {1, 6, 10, 20, 40, 64}) {
+    config.batch_size = batch_size;
+    EXPECT_EQ(sycl_backend::supports_fused_single_query_attention_fp16(config),
+              supports_batched);
+  }
+  config.batch_size = 65;
+  EXPECT_FALSE(sycl_backend::supports_fused_single_query_attention_fp16(config));
+
+  if (supports_batched) {
+    for (const auto [batch_size, maximum_key_length]
+         : std::vector<std::pair<dim_t, dim_t>>{
+             {6, 128}, {10, 128}, {11, 64}, {20, 64},
+             {21, 16}, {64, 16}}) {
+      config.batch_size = batch_size;
+      config.key_length = maximum_key_length;
+      EXPECT_TRUE(sycl_backend::supports_fused_single_query_attention_fp16(config));
+      ++config.key_length;
+      EXPECT_FALSE(sycl_backend::supports_fused_single_query_attention_fp16(config));
+    }
+  }
+
+  config.batch_size = default_batch_size;
   config.key_length = 320;
   EXPECT_TRUE(sycl_backend::supports_fused_single_query_attention_fp16(config));
 
@@ -105,9 +166,9 @@ TEST(SYCLFusedAttentionTest, DispatchPredicateIsStrict) {
   config.head_dim = 32;
   EXPECT_FALSE(sycl_backend::supports_fused_single_query_attention_fp16(config));
   config.head_dim = head_dim;
-  config.batch_size = 4;
+  config.batch_size = 0;
   EXPECT_FALSE(sycl_backend::supports_fused_single_query_attention_fp16(config));
-  config.batch_size = batch_size;
+  config.batch_size = default_batch_size;
   config.num_heads = 16;
   EXPECT_FALSE(sycl_backend::supports_fused_single_query_attention_fp16(config));
   config.num_heads = num_heads;

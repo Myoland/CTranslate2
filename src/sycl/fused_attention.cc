@@ -3,6 +3,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 #include "sycl/helpers.h"
 
@@ -12,7 +13,8 @@ namespace ctranslate2 {
 
       constexpr size_t attention_work_group_size = 256;
       constexpr dim_t attention_head_dim = 64;
-      constexpr dim_t attention_batch_size = 5;
+      constexpr dim_t original_attention_batch_size = 5;
+      constexpr dim_t maximum_attention_batch_size = 64;
       constexpr dim_t attention_num_heads = 20;
       constexpr dim_t maximum_profitable_key_length = 320;
       constexpr size_t value_reduction_width = 4;
@@ -25,22 +27,79 @@ namespace ctranslate2 {
                + attention_work_group_size * sizeof(float);
       }
 
+      // oneMKL amortizes its launch cost as either the decoder row count or
+      // cache length grows. These piecewise limits keep this scalar fused
+      // kernel only where B580 microbenchmarks show a useful win.
+      bool is_fused_attention_profitable(const dim_t batch_size,
+                                         const dim_t key_length) {
+        if (batch_size <= 5)
+          return key_length <= 320;
+        if (batch_size <= 10)
+          return key_length <= 128;
+        if (batch_size <= 20)
+          return key_length <= 64;
+        return key_length <= 16;
+      }
+
+      bool device_supports_batched_fused_attention() {
+        struct Cache {
+          int device_index = -2;
+          bool supported = false;
+        };
+        thread_local Cache cache;
+        const int device_index = get_device_index();
+        if (cache.device_index != device_index) {
+          const std::string name
+            = get_device(device_index).get_info<::sycl::info::device::name>();
+          cache.device_index = device_index;
+          cache.supported = name.find("B580") != std::string::npos;
+        }
+        return cache.supported;
+      }
+
       bool can_run_fused_single_query_attention_fp16(const dim_t batch_size,
                                                      const dim_t num_heads,
                                                      const dim_t key_length,
                                                      const dim_t head_dim) {
-        if (batch_size != attention_batch_size
+        if (batch_size <= 0
+            || batch_size > maximum_attention_batch_size
             || num_heads != attention_num_heads
             || key_length <= 0
-            || head_dim != attention_head_dim)
+            || key_length > maximum_profitable_key_length
+            || head_dim != attention_head_dim
+            || !is_fused_attention_profitable(batch_size, key_length))
+          return false;
+
+        // Preserve the original exact beam-5 dispatch on other SYCL GPUs.
+        // The expanded row/key profitability table was measured on B580.
+        if (batch_size != original_attention_batch_size
+            && !device_supports_batched_fused_attention())
           return false;
 
         const ::sycl::device& device = get_device();
-        return device.has(::sycl::aspect::fp16)
-               && device.get_info<::sycl::info::device::max_work_group_size>()
-                    >= attention_work_group_size
-               && required_local_memory(key_length)
-                    <= device.get_info<::sycl::info::device::local_mem_size>();
+        if (!device.has(::sycl::aspect::fp16)
+            || device.get_info<::sycl::info::device::max_work_group_size>()
+                 < attention_work_group_size
+            || required_local_memory(key_length)
+                 > device.get_info<::sycl::info::device::local_mem_size>())
+          return false;
+
+        // Every work-group owns one independent [batch, head] row. Keep the
+        // flattened launch and pointer offsets representable even if this
+        // internal entry point is called with dimensions not backed by a
+        // StorageView.
+        const size_t batch = static_cast<size_t>(batch_size);
+        const size_t heads = static_cast<size_t>(num_heads);
+        const size_t keys = static_cast<size_t>(key_length);
+        const size_t head = static_cast<size_t>(head_dim);
+        const size_t maximum = std::numeric_limits<size_t>::max();
+        if (batch > maximum / heads || keys > maximum / head)
+          return false;
+        const size_t rows = batch * heads;
+        const size_t keys_per_row = keys * head;
+        return rows <= maximum / attention_work_group_size
+               && rows <= maximum / head
+               && rows <= maximum / keys_per_row;
       }
 
       class FusedSingleQueryAttentionFP16Kernel;
@@ -49,7 +108,8 @@ namespace ctranslate2 {
 
     bool supports_fused_single_query_attention_fp16(
       const FusedSingleQueryAttentionFP16Config& config) {
-      if (config.batch_size != attention_batch_size
+      if (config.batch_size <= 0
+          || config.batch_size > maximum_attention_batch_size
           || config.num_heads != attention_num_heads
           || config.query_length != 1
           || config.key_length <= 0

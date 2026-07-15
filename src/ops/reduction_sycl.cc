@@ -5,12 +5,57 @@
 #include "ctranslate2/ops/rms_norm.h"
 #include "ctranslate2/ops/softmax.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <limits>
+#include <string>
+#include <type_traits>
 
 #include "sycl/ops_utils.h"
 
 namespace ctranslate2 {
   namespace ops {
+    namespace {
+
+      constexpr size_t softmax_work_group_size = 256;
+      constexpr size_t softmax_subgroup_size = 32;
+
+      bool supports_softmax_subgroup_reduction(const int device_index,
+                                                const dim_t depth) {
+        struct Cache {
+          int device_index = -2;
+          bool supported = false;
+          size_t local_memory_size = 0;
+        };
+        thread_local Cache cache;
+        if (cache.device_index != device_index) {
+          const ::sycl::device& device = sycl_backend::get_device(device_index);
+          const std::string name
+            = device.get_info<::sycl::info::device::name>();
+          const auto subgroup_sizes
+            = device.get_info<::sycl::info::device::sub_group_sizes>();
+          cache.device_index = device_index;
+          cache.supported
+            = name.find("B580") != std::string::npos
+              && device.get_info<::sycl::info::device::max_work_group_size>()
+                >= softmax_work_group_size
+              && std::find(subgroup_sizes.begin(),
+                           subgroup_sizes.end(),
+                           softmax_subgroup_size) != subgroup_sizes.end();
+          cache.local_memory_size
+            = device.get_info<::sycl::info::device::local_mem_size>();
+        }
+
+        if (!cache.supported || depth <= 0)
+          return false;
+        const size_t float_capacity = cache.local_memory_size / sizeof(float);
+        if (float_capacity < softmax_work_group_size)
+          return false;
+        return static_cast<size_t>(depth) <= float_capacity
+                                              - softmax_work_group_size;
+      }
+
+    }
 
     template <Device D, typename T>
     void LayerNorm::compute(const StorageView* beta,
@@ -158,6 +203,108 @@ namespace ctranslate2 {
       const dim_t rows = input.size() / depth;
       const size_t wg = sycl_backend::work_group_size();
       const bool log_softmax = _log;
+
+      // The B580 encoder submits many wide FP16 SoftMax rows. Preserve the
+      // original binary reduction tree, but finish its last 32 lanes with
+      // subgroup shuffles. Cache the FP32 exponentials in local memory so the
+      // normalization pass neither reloads the input nor evaluates exp again.
+      // Devices that cannot run the exact 256/32 geometry or safely fit the
+      // cache retain the generic implementation. LogSoftMax is unchanged.
+      if constexpr (std::is_same_v<T, float16_t>) {
+        if (!log_softmax
+            && wg == softmax_work_group_size
+            && supports_softmax_subgroup_reduction(input.device_index(), depth)) {
+          sycl_backend::get_queue().submit([&](::sycl::handler& handler) {
+            ::sycl::local_accessor<float, 1> scratch(
+              softmax_work_group_size, handler);
+            ::sycl::local_accessor<float, 1> exponentials(
+              static_cast<size_t>(depth), handler);
+            handler.parallel_for(
+              ::sycl::nd_range<1>(rows * softmax_work_group_size,
+                                  softmax_work_group_size),
+              [=](::sycl::nd_item<1> item)
+                [[sycl::reqd_sub_group_size(softmax_subgroup_size)]] {
+              const dim_t row = item.get_group(0);
+              const size_t lid = item.get_local_id(0);
+              const ::sycl::sub_group subgroup = item.get_sub_group();
+              const size_t lane = subgroup.get_local_linear_id();
+              dim_t active = length_data ? dim_t(length_data[row]) : depth;
+              active = active < 0 ? 0 : (active > depth ? depth : active);
+
+              float maximum = -std::numeric_limits<float>::infinity();
+              for (dim_t i = lid; i < active; i += softmax_work_group_size) {
+                maximum = ::sycl::fmax(
+                  maximum, sycl_backend::to_float(x[row * depth + i]));
+              }
+              scratch[lid] = maximum;
+              item.barrier(::sycl::access::fence_space::local_space);
+              for (size_t stride = softmax_work_group_size / 2;
+                   stride >= softmax_subgroup_size;
+                   stride >>= 1) {
+                if (lid < stride) {
+                  scratch[lid] = ::sycl::fmax(scratch[lid],
+                                               scratch[lid + stride]);
+                }
+                item.barrier(::sycl::access::fence_space::local_space);
+              }
+              maximum = scratch[lid];
+              for (size_t stride = softmax_subgroup_size / 2;
+                   stride > 0;
+                   stride >>= 1) {
+                const float other = ::sycl::shift_group_left(
+                  subgroup, maximum, static_cast<uint32_t>(stride));
+                if (lane < stride)
+                  maximum = ::sycl::fmax(maximum, other);
+              }
+              if (lid == 0)
+                scratch[0] = maximum;
+              item.barrier(::sycl::access::fence_space::local_space);
+              maximum = scratch[0];
+              // All subgroups must read the maximum before lane 0 reuses
+              // scratch[0] for its partial exponential sum.
+              item.barrier(::sycl::access::fence_space::local_space);
+
+              float sum = 0.f;
+              for (dim_t i = lid; i < active; i += softmax_work_group_size) {
+                const float exponential = ::sycl::exp(
+                  sycl_backend::to_float(x[row * depth + i]) - maximum);
+                exponentials[i] = exponential;
+                sum += exponential;
+              }
+              scratch[lid] = sum;
+              item.barrier(::sycl::access::fence_space::local_space);
+              for (size_t stride = softmax_work_group_size / 2;
+                   stride >= softmax_subgroup_size;
+                   stride >>= 1) {
+                if (lid < stride)
+                  scratch[lid] += scratch[lid + stride];
+                item.barrier(::sycl::access::fence_space::local_space);
+              }
+              sum = scratch[lid];
+              for (size_t stride = softmax_subgroup_size / 2;
+                   stride > 0;
+                   stride >>= 1) {
+                const float other = ::sycl::shift_group_left(
+                  subgroup, sum, static_cast<uint32_t>(stride));
+                if (lane < stride)
+                  sum += other;
+              }
+              if (lid == 0)
+                scratch[0] = sum;
+              item.barrier(::sycl::access::fence_space::local_space);
+              const float denominator = scratch[0];
+
+              for (dim_t i = lid; i < depth; i += softmax_work_group_size) {
+                float value = 0.f;
+                if (i < active)
+                  value = exponentials[i] / denominator;
+                y[row * depth + i] = sycl_backend::from_float<DT>(value);
+              }
+            });
+          });
+          return;
+        }
+      }
 
       sycl_backend::get_queue().submit([&](::sycl::handler& handler) {
         ::sycl::local_accessor<float, 1> scratch(wg, handler);
