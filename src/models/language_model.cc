@@ -1,6 +1,7 @@
 #include "ctranslate2/models/language_model.h"
 
 #include "ctranslate2/decoding.h"
+#include "layers/decoder_cache.h"
 
 namespace ctranslate2 {
   namespace models {
@@ -141,8 +142,14 @@ namespace ctranslate2 {
 
       } else {
         const ops::Tile tile_op(/*axis=*/0, /*repeats=*/batch_size);
-        for (const auto& [name, value] : from)
-          tile_op(value, to[name]);
+        const bool has_deferred_cache_indices
+          = from.find(layers::detail::deferred_self_cache_indices_name) != from.end();
+        for (const auto& [name, value] : from) {
+          if (has_deferred_cache_indices && layers::detail::is_self_cache(name))
+            to[name] = value;
+          else
+            tile_op(value, to[name]);
+        }
       }
     }
 

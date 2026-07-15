@@ -175,6 +175,13 @@ namespace ctranslate2 {
       DecoderState initial_state(bool iterative_decoding = true) const override;
       bool replicate_state(const std::string& name) const override;
 
+      // Returns whether beam-cache gathers can be deferred until the next
+      // non-flash self-attention invocation. This is intentionally non-virtual
+      // to preserve the Decoder ABI.
+      bool should_defer_self_cache_gather() const {
+        return _device == Device::SYCL && !_use_flash_attention;
+      }
+
       void operator()(dim_t step,
                       const StorageView& ids,
                       DecoderState& state,

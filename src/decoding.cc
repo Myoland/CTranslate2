@@ -7,6 +7,7 @@
 
 #include "ctranslate2/ops/ops.h"
 #include "dispatch.h"
+#include "layers/decoder_cache.h"
 
 namespace ctranslate2 {
 
@@ -751,9 +752,14 @@ namespace ctranslate2 {
     // We can return multiple hypotheses from greedy search when random sampling is enabled.
     // In that case we replicate the batches and then merge the hypotheses in a single result.
     if (num_hypotheses > 1) {
+      const bool has_deferred_cache_indices
+        = state.find(layers::detail::deferred_self_cache_indices_name) != state.end();
       for (auto& [name, value] : state) {
-        if (value)
+        if (value
+            && !(has_deferred_cache_indices
+                 && layers::detail::is_self_cache(name))) {
           repeat_batch(value, num_hypotheses);
+        }
       }
 
       std::vector<size_t> repeat_start_ids = repeat_vector(start_ids, num_hypotheses);
@@ -975,8 +981,13 @@ namespace ctranslate2 {
 
   static layers::DecoderState get_batch_state(const layers::DecoderState& state,
                                               const int32_t batch_id) {
-    const Device device = state.begin()->second.device();
     const ops::Gather gather_op;
+
+    const auto deferred_indices_it
+      = state.find(layers::detail::deferred_self_cache_indices_name);
+    const Device device = deferred_indices_it != state.end()
+      ? deferred_indices_it->second.device()
+      : state.begin()->second.device();
 
     StorageView indices(batch_id, device);
     indices.reshape({1});
@@ -984,12 +995,37 @@ namespace ctranslate2 {
     layers::DecoderState batch_state;
     batch_state.reserve(state.size());
 
+    StorageView selected_cache_indices(DataType::INT32, device);
+    if (deferred_indices_it != state.end())
+      gather_op(deferred_indices_it->second, indices, selected_cache_indices);
+
     for (const auto& pair : state) {
       const auto& name = pair.first;
       const auto& value = pair.second;
-      StorageView batch_value(value.dtype(), device);
-      if (value)
-        gather_op(value, indices, batch_value);
+      if (name == layers::detail::deferred_self_cache_indices_name)
+        continue;
+
+      StorageView batch_value(value.dtype(), value.device());
+      if (value) {
+        if (deferred_indices_it != state.end()
+            && layers::detail::is_self_cache(name)) {
+          const StorageView* cache_indices = &selected_cache_indices;
+          StorageView cache_indices_on_device(DataType::INT32, value.device());
+          if (selected_cache_indices.device() != value.device()) {
+            cache_indices_on_device = selected_cache_indices.to(value.device());
+            cache_indices = &cache_indices_on_device;
+          }
+          gather_op(value, *cache_indices, batch_value);
+        } else {
+          const StorageView* batch_indices = &indices;
+          StorageView batch_indices_on_device(DataType::INT32, value.device());
+          if (indices.device() != value.device()) {
+            batch_indices_on_device = indices.to(value.device());
+            batch_indices = &batch_indices_on_device;
+          }
+          gather_op(value, *batch_indices, batch_value);
+        }
+      }
       batch_state.emplace(name, std::move(batch_value));
     }
 
@@ -1223,7 +1259,18 @@ namespace ctranslate2 {
 
     const size_t num_alternatives = start_ids.size();
 
+    const bool has_deferred_cache_indices
+      = state.find(layers::detail::deferred_self_cache_indices_name) != state.end();
     for (auto& [name, value] : state) {
+      if (has_deferred_cache_indices) {
+        if (name == layers::detail::deferred_self_cache_indices_name) {
+          if (num_alternatives < options.num_hypotheses)
+            value.resize(0, num_alternatives);
+          continue;
+        }
+        if (layers::detail::is_self_cache(name))
+          continue;
+      }
       if (decoder.replicate_state(name)) {
         // Reduce state to the effective number of alternatives.
         if (num_alternatives < options.num_hypotheses)

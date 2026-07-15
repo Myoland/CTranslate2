@@ -177,6 +177,7 @@ namespace ctranslate2 {
             item.barrier(::sycl::access::fence_space::local_space);
           }
           maximum = scratch[0];
+          item.barrier(::sycl::access::fence_space::local_space);
           float sum = 0.f;
           for (dim_t i = lid; i < active; i += wg)
             sum += ::sycl::exp(sycl_backend::to_float(x[row * depth + i]) - maximum);

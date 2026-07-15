@@ -8,8 +8,13 @@
 #include "cpu/backend.h"
 #include "dispatch.h"
 
+#ifdef CT2_WITH_SYCL
+#  include "sycl/fused_qkv_projection.h"
+#endif
+
 namespace ctranslate2 {
   namespace layers {
+#ifdef CT2_WITH_SYCL
     namespace {
 
       bool storage_ranges_overlap(const StorageView& a, const StorageView& b) {
@@ -31,6 +36,7 @@ namespace ctranslate2 {
       }
 
     }
+#endif
 
     StorageView
     make_sequence_inputs(const std::vector<std::vector<size_t>>& ids,
@@ -517,6 +523,10 @@ namespace ctranslate2 {
             return false;
         }
       }
+
+      if (sycl_backend::fused_qkv_projection_fp16(
+            input, _weight, *_bias, output1, output2, output3))
+        return true;
 
       // The regular Gemm path applies the bias after oneMKL returns. Submit
       // the identical Gemm without postprocessing, then perform the same FP32

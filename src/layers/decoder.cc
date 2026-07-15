@@ -1,4 +1,5 @@
 #include "ctranslate2/layers/decoder.h"
+#include "ctranslate2/layers/transformer.h"
 
 #include <algorithm>
 #include <numeric>
@@ -6,6 +7,7 @@
 #include "ctranslate2/decoding_utils.h"
 #include "ctranslate2/ops/ops.h"
 #include "dispatch.h"
+#include "layers/decoder_cache.h"
 
 namespace ctranslate2 {
   namespace layers {
@@ -31,6 +33,20 @@ namespace ctranslate2 {
     }
 
     void Decoder::update_state(DecoderState& state, const StorageView& alive_batches) const {
+      const auto* transformer_decoder = dynamic_cast<const TransformerDecoder*>(this);
+      if (transformer_decoder
+          && transformer_decoder->should_defer_self_cache_gather()) {
+        for (auto& [name, value] : state) {
+          if (name != detail::deferred_self_cache_indices_name
+              && !detail::is_self_cache(name))
+            ops::Gather()(value, alive_batches);
+        }
+        detail::defer_cache_gather(state,
+                                   StorageView(alive_batches),
+                                   detail::deferred_self_cache_indices_name);
+        return;
+      }
+
       for (auto& pair : state) {
         ops::Gather()(pair.second, alive_batches);
       }
@@ -46,6 +62,24 @@ namespace ctranslate2 {
         merge_batch_beam(beam_indices);
       }
 
+      const auto* transformer_decoder = dynamic_cast<const TransformerDecoder*>(this);
+      if (transformer_decoder
+          && transformer_decoder->should_defer_self_cache_gather()) {
+        for (auto& [name, value] : state) {
+          if (name == detail::deferred_self_cache_indices_name
+              || detail::is_self_cache(name))
+            continue;
+          if (replicate_state(name))
+            ops::Gather()(value, beam_indices);
+          else if (alive_batches)
+            ops::Gather()(value, *alive_batches);
+        }
+        detail::defer_cache_gather(state,
+                                   std::move(beam_indices),
+                                   detail::deferred_self_cache_indices_name);
+        return;
+      }
+
       for (auto& [name, value] : state) {
         if (replicate_state(name))
           ops::Gather()(value, beam_indices);
@@ -55,6 +89,27 @@ namespace ctranslate2 {
     }
 
     void Decoder::replicate_state(DecoderState& state, const dim_t beam_size) const {
+      const auto* transformer_decoder = dynamic_cast<const TransformerDecoder*>(this);
+      const auto deferred_indices
+        = state.find(detail::deferred_self_cache_indices_name);
+      if (transformer_decoder
+          && transformer_decoder->should_defer_self_cache_gather()
+          && deferred_indices != state.end()) {
+        for (auto& [name, value] : state) {
+          if (!value)
+            continue;
+          if (name == detail::deferred_self_cache_indices_name) {
+            // Replicate the logical-to-physical cache mapping while leaving
+            // the physical self-attention caches untouched.
+            repeat_batch(value, beam_size);
+          } else if (!detail::is_self_cache(name)
+                     && replicate_state(name)) {
+            repeat_batch(value, beam_size);
+          }
+        }
+        return;
+      }
+
       for (auto& [name, value] : state) {
         if (value && replicate_state(name))
           repeat_batch(value, beam_size);
@@ -62,6 +117,10 @@ namespace ctranslate2 {
     }
 
     dim_t Decoder::batch_size(const DecoderState& state) const {
+      const auto deferred_indices
+        = state.find(detail::deferred_self_cache_indices_name);
+      if (deferred_indices != state.end())
+        return deferred_indices->second.dim(0);
       return state.begin()->second.dim(0);
     }
 

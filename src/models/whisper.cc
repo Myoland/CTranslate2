@@ -1,6 +1,8 @@
 #include "ctranslate2/models/whisper.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 
 #include "ctranslate2/decoding.h"
 
@@ -824,6 +826,59 @@ namespace ctranslate2 {
         if (!check_timestamps_prob_for_batch.empty()) {
           // Apply all changes to the logits before computing the log softmax.
           disable_tokens.apply();
+
+#ifdef CT2_WITH_SYCL
+          if (logits.device() == Device::SYCL && batch_size <= 64) {
+            uint64_t check_rows = 0;
+            for (const dim_t batch_id : check_timestamps_prob_for_batch)
+              check_rows |= uint64_t(1) << batch_id;
+
+            // Evaluate the rule in one asynchronous kernel. The primitive
+            // reproduces LogSoftMax rounding for reduced-precision logits
+            // without materializing the full log-probability tensor or
+            // synchronizing intermediate reductions with the host.
+            switch (logits.dtype()) {
+              TYPE_CASE(
+                float,
+                primitives<Device::SYCL>::suppress_text_if_timestamp(
+                  logits.data<T>(),
+                  logits.data<T>(),
+                  batch_size,
+                  logits.dim(1),
+                  _timestamp_begin_id,
+                  _timestamp_begin_id,
+                  _timestamp_end_id - _timestamp_begin_id + 1,
+                  check_rows,
+                  static_cast<T>(std::numeric_limits<float>::lowest())))
+              TYPE_CASE(
+                float16_t,
+                primitives<Device::SYCL>::suppress_text_if_timestamp(
+                  logits.data<T>(),
+                  logits.data<T>(),
+                  batch_size,
+                  logits.dim(1),
+                  _timestamp_begin_id,
+                  _timestamp_begin_id,
+                  _timestamp_end_id - _timestamp_begin_id + 1,
+                  check_rows,
+                  static_cast<T>(std::numeric_limits<float>::lowest())))
+              TYPE_CASE(
+                bfloat16_t,
+                primitives<Device::SYCL>::suppress_text_if_timestamp(
+                  logits.data<T>(),
+                  logits.data<T>(),
+                  batch_size,
+                  logits.dim(1),
+                  _timestamp_begin_id,
+                  _timestamp_begin_id,
+                  _timestamp_end_id - _timestamp_begin_id + 1,
+                  check_rows,
+                  static_cast<T>(std::numeric_limits<float>::lowest())))
+              NON_FLOAT_CASE("ApplyTimestampRules")
+            }
+            return;
+          }
+#endif
 
           StorageView log_probs(logits.dtype(), logits.device());
           ops::LogSoftMax()(logits, log_probs);

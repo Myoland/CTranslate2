@@ -9,6 +9,12 @@
 
 #include "dispatch.h"
 #include "cpu/parallel.h"
+#include "layers/decoder_cache.h"
+
+#ifdef CT2_WITH_SYCL
+#  include "sycl/cache_gather_append.h"
+#  include "sycl/fused_attention.h"
+#endif
 
 namespace ctranslate2 {
   namespace layers {
@@ -194,8 +200,61 @@ namespace ctranslate2 {
                                       bool with_cache = false,
                                       dim_t beam_size = 1,
                                       Alibi* alibi = nullptr,
-                                      StorageView* position_bias = nullptr) {
+                                      StorageView* position_bias = nullptr,
+                                      bool allow_fused_single_query_attention = false) {
       PROFILE("dot_product_attention");
+
+#ifdef CT2_WITH_SYCL
+      if (allow_fused_single_query_attention
+          && queries.device() == Device::SYCL
+          && queries.dtype() == DataType::FLOAT16
+          && queries.rank() == 4
+          && keys.device() == queries.device()
+          && values.device() == queries.device()
+          && keys.device_index() == queries.device_index()
+          && values.device_index() == queries.device_index()
+          && keys.dtype() == queries.dtype()
+          && values.dtype() == queries.dtype()
+          && keys.rank() == 4
+          && values.shape() == keys.shape()
+          && keys.dim(0) == queries.dim(0)
+          && keys.dim(1) == queries.dim(1)
+          && keys.dim(3) == queries.dim(3)
+          && output.device() == queries.device()
+          && output.device_index() == queries.device_index()
+          && output.dtype() == queries.dtype()) {
+        const sycl_backend::FusedSingleQueryAttentionFP16Config config{
+          queries.dim(0),
+          queries.dim(1),
+          queries.dim(2),
+          keys.dim(2),
+          queries.dim(3),
+          values_lengths != nullptr,
+          attention != nullptr,
+          relative_position_keys != nullptr
+            || relative_asymmetric_position_keys != nullptr
+            || relative_position_values != nullptr
+            || relative_attention_bias != nullptr,
+          alibi != nullptr,
+        };
+        if (sycl_backend::supports_fused_single_query_attention_fp16(config)) {
+          output.resize(queries.shape());
+          sycl_backend::fused_single_query_attention_fp16(
+            queries.data<float16_t>(),
+            keys.data<float16_t>(),
+            values.data<float16_t>(),
+            output.data<float16_t>(),
+            config.batch_size,
+            config.num_heads,
+            config.key_length,
+            config.head_dim,
+            queries_scale);
+          return;
+        }
+      }
+#else
+      (void)allow_fused_single_query_attention;
+#endif
 
       std::unique_ptr<const StorageView> relative_positions;
       if (relative_position_keys || relative_position_values || relative_asymmetric_position_keys) {
@@ -439,6 +498,43 @@ namespace ctranslate2 {
       split_heads(queries_proj, _num_heads, queries_padder, beam_size);
     }
 
+    static void append_to_kv_cache(StorageView& cached_keys,
+                                   StorageView& cached_values,
+                                   const StorageView& keys,
+                                   const StorageView& values,
+                                   const dim_t time_axis,
+                                   const StorageView* cache_indices) {
+      StorageView previous_keys(std::move(cached_keys));
+      StorageView previous_values(std::move(cached_values));
+      const ops::Concat concat_op(time_axis);
+
+      if (cache_indices) {
+#ifdef CT2_WITH_SYCL
+        if (keys.device() == Device::SYCL) {
+          sycl_backend::cache_gather_append(previous_keys,
+                                            previous_values,
+                                            *cache_indices,
+                                            keys,
+                                            values,
+                                            time_axis,
+                                            cached_keys,
+                                            cached_values);
+          return;
+        }
+#endif
+
+        StorageView gathered_keys(keys.dtype(), keys.device());
+        StorageView gathered_values(values.dtype(), values.device());
+        ops::Gather()(previous_keys, *cache_indices, gathered_keys);
+        ops::Gather()(previous_values, *cache_indices, gathered_values);
+        concat_op({&gathered_keys, &keys}, cached_keys);
+        concat_op({&gathered_values, &values}, cached_values);
+      } else {
+        concat_op({&previous_keys, &keys}, cached_keys);
+        concat_op({&previous_values, &values}, cached_values);
+      }
+    }
+
     void MultiHeadAttention::operator()(const StorageView& queries,
                                         const StorageView& values,
                                         const StorageView* values_lengths,
@@ -561,12 +657,15 @@ namespace ctranslate2 {
             *cached_keys = std::move(keys_proj);
             *cached_values = std::move(values_proj);
           } else {
-            const ops::Concat concat_op(_cache_time_dim);
             StorageView& tmp = fused_proj;  // Reuse storage.
-            tmp = std::move(*cached_keys);
-            concat_op({&tmp, &keys_proj}, *cached_keys);
-            tmp = std::move(*cached_values);
-            concat_op({&tmp, &values_proj}, *cached_values);
+            append_to_kv_cache(*cached_keys,
+                               *cached_values,
+                               keys_proj,
+                               values_proj,
+                               _cache_time_dim,
+                               _self_attention
+                                 ? detail::get_self_cache_indices()
+                                 : nullptr);
 
             if (!prefilling && _sliding_window > 0 && cached_keys->shape()[2] > _sliding_window) {
               // only for generation
@@ -605,7 +704,8 @@ namespace ctranslate2 {
                             bool(cached_keys),
                             beam_size,
                             _alibi,
-                            position_bias);
+                            position_bias,
+                            _self_attention);
 
       if (prefilling && cached_keys && cached_keys->shape()[2] > _sliding_window) {
         // set only last sliding_window tokens to cached_keys and cached_values after computing attention
@@ -707,12 +807,12 @@ namespace ctranslate2 {
           *cached_self_keys = std::move(keys_proj);
           *cached_self_values = std::move(values_proj);
         } else {
-          const ops::Concat concat_op(2);
-          StorageView tmp(dtype, device);
-          tmp = std::move(*cached_self_keys);
-          concat_op({&tmp, &keys_proj}, *cached_self_keys);
-          tmp = std::move(*cached_self_values);
-          concat_op({&tmp, &values_proj}, *cached_self_values);
+          append_to_kv_cache(*cached_self_keys,
+                             *cached_self_values,
+                             keys_proj,
+                             values_proj,
+                             /*time_axis=*/2,
+                             detail::get_self_cache_indices());
         }
         keys_proj.shallow_copy(*cached_self_keys);
         values_proj.shallow_copy(*cached_self_values);

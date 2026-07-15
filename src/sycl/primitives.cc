@@ -12,6 +12,7 @@
 
 #include "ctranslate2/allocator.h"
 #include "sycl/helpers.h"
+#include "sycl/ops_utils.h"
 #include "sycl/utils.h"
 #include "type_dispatch.h"
 
@@ -30,6 +31,99 @@ namespace ctranslate2 {
         return T(static_cast<float>(value));
       else
         return static_cast<T>(value);
+    }
+
+    inline uint32_t round_shift_right_to_even(const uint32_t value,
+                                              const unsigned shift) {
+      const uint32_t truncated = value >> shift;
+      const uint32_t remainder_mask = (uint32_t(1) << shift) - 1;
+      const uint32_t remainder = value & remainder_mask;
+      const uint32_t halfway = uint32_t(1) << (shift - 1);
+      return truncated
+        + (remainder > halfway || (remainder == halfway && (truncated & 1)));
+    }
+
+    inline float float16_bits_to_float(const uint16_t bits) {
+      const uint32_t sign = uint32_t(bits & 0x8000) << 16;
+      const uint32_t exponent = (bits >> 10) & 0x1f;
+      const uint32_t mantissa = bits & 0x03ff;
+
+      if (exponent == 0) {
+        if (mantissa == 0)
+          return ::sycl::bit_cast<float>(sign);
+        const float magnitude = static_cast<float>(mantissa) * 0x1p-24f;
+        return (sign == 0 ? magnitude : -magnitude);
+      }
+
+      const uint32_t float_exponent = exponent == 0x1f
+        ? 0xff
+        : exponent + 112;
+      return ::sycl::bit_cast<float>(sign
+                                     | (float_exponent << 23)
+                                     | (mantissa << 13));
+    }
+
+    inline float round_float_to_float16(const float value) {
+      const uint32_t bits = ::sycl::bit_cast<uint32_t>(value);
+      const uint16_t sign = static_cast<uint16_t>((bits >> 16) & 0x8000);
+      const uint32_t exponent_bits = (bits >> 23) & 0xff;
+      const uint32_t mantissa = bits & 0x007fffff;
+
+      if (exponent_bits == 0xff) {
+        const uint16_t half_mantissa = mantissa == 0
+          ? 0
+          : static_cast<uint16_t>((mantissa >> 13) | 0x0200);
+        return float16_bits_to_float(sign | 0x7c00 | half_mantissa);
+      }
+
+      const int exponent = static_cast<int>(exponent_bits) - 127;
+      const uint32_t significand = mantissa | 0x00800000;
+      uint16_t magnitude = 0;
+      if (exponent > 15) {
+        magnitude = 0x7c00;
+      } else if (exponent >= -14) {
+        uint32_t rounded = round_shift_right_to_even(significand, 13);
+        int rounded_exponent = exponent;
+        if (rounded == 0x0800) {
+          rounded = 0x0400;
+          ++rounded_exponent;
+        }
+        if (rounded_exponent > 15) {
+          magnitude = 0x7c00;
+        } else {
+          magnitude = static_cast<uint16_t>(((rounded_exponent + 15) << 10)
+                                            | (rounded - 0x0400));
+        }
+      } else if (exponent >= -25) {
+        magnitude = static_cast<uint16_t>(
+          round_shift_right_to_even(significand,
+                                    static_cast<unsigned>(-exponent - 1)));
+      }
+
+      return float16_bits_to_float(sign | magnitude);
+    }
+
+    inline float round_float_to_bfloat16(const float value) {
+      uint32_t bits = ::sycl::bit_cast<uint32_t>(value);
+      const uint32_t exponent = bits & 0x7f800000;
+      const uint32_t mantissa = bits & 0x007fffff;
+      if (exponent == 0x7f800000) {
+        if (mantissa != 0)
+          bits |= 0x00400000;
+        return ::sycl::bit_cast<float>(bits & 0xffff0000);
+      }
+      bits += 0x00007fff + ((bits >> 16) & 1);
+      return ::sycl::bit_cast<float>(bits & 0xffff0000);
+    }
+
+    template <typename T>
+    inline float round_to_device_precision(const float value) {
+      if constexpr (std::is_same_v<T, ::sycl::half>)
+        return round_float_to_float16(value);
+      else if constexpr (std::is_same_v<T, ::sycl::ext::oneapi::bfloat16>)
+        return round_float_to_bfloat16(value);
+      else
+        return value;
     }
 
     // Copies the contiguous innermost rows while swapping dimensions 1 and 2.
@@ -737,6 +831,136 @@ namespace ctranslate2 {
 
   template <>
   template <typename T>
+  void primitives<Device::SYCL>::suppress_text_if_timestamp(
+    T* logits,
+    const T* scores,
+    const dim_t rows,
+    const dim_t depth,
+    const dim_t num_text_tokens,
+    const dim_t timestamp_begin,
+    const dim_t num_timestamp_tokens,
+    const uint64_t check_rows,
+    const T disable_value) {
+    if (rows > 64)
+      throw std::invalid_argument("Whisper timestamp row mask supports at most 64 rows");
+    if (depth < 0 || num_text_tokens < 0 || num_text_tokens > depth
+        || timestamp_begin < 0 || timestamp_begin > depth
+        || num_timestamp_tokens < 0
+        || num_timestamp_tokens > depth - timestamp_begin) {
+      throw std::invalid_argument("Whisper timestamp ranges are outside the score depth");
+    }
+    if (rows <= 0 || depth <= 0 || num_text_tokens <= 0
+        || num_timestamp_tokens <= 0 || check_rows == 0)
+      return;
+
+    auto& queue = sycl_backend::get_queue();
+    const size_t local_size = sycl_backend::work_group_size();
+    using DeviceT = sycl_backend::device_type_t<T>;
+    auto* device_logits = sycl_backend::device_cast(logits);
+    const auto* device_scores = sycl_backend::device_cast(scores);
+    const DeviceT device_disable_value = sycl_backend::device_scalar(disable_value);
+    const float lowest = std::numeric_limits<float>::lowest();
+    const float negative_infinity = -std::numeric_limits<float>::infinity();
+
+    queue.submit([&](::sycl::handler& handler) {
+      ::sycl::local_accessor<float, 1> scratch(local_size, handler);
+      handler.parallel_for(
+        ::sycl::nd_range<1>(::sycl::range<1>(static_cast<size_t>(rows) * local_size),
+                            ::sycl::range<1>(local_size)),
+        [=](::sycl::nd_item<1> item) {
+        const dim_t row = static_cast<dim_t>(item.get_group_linear_id());
+        if ((check_rows & (uint64_t(1) << row)) == 0)
+          return;
+
+        const dim_t local_id = static_cast<dim_t>(item.get_local_linear_id());
+        const dim_t group_size = static_cast<dim_t>(item.get_local_range(0));
+        const auto group = item.get_group();
+        const auto* row_scores = device_scores + row * depth;
+
+        // Reproduce the low-precision values produced by LogSoftMax before
+        // evaluating the timestamp rule. Although the normalization constant
+        // cancels algebraically in exact arithmetic, rounding each normalized
+        // score to FLOAT16 or BFLOAT16 can change a boundary decision.
+        float normalization_max = negative_infinity;
+        for (dim_t i = local_id; i < depth; i += group_size)
+          normalization_max = ::sycl::fmax(
+            normalization_max,
+            sycl_backend::to_float(row_scores[i]));
+        scratch[local_id] = normalization_max;
+        item.barrier(::sycl::access::fence_space::local_space);
+        for (dim_t stride = group_size / 2; stride > 0; stride >>= 1) {
+          if (local_id < stride) {
+            scratch[local_id] = ::sycl::fmax(scratch[local_id],
+                                             scratch[local_id + stride]);
+          }
+          item.barrier(::sycl::access::fence_space::local_space);
+        }
+        normalization_max = scratch[0];
+        item.barrier(::sycl::access::fence_space::local_space);
+
+        float row_exp_sum = 0;
+        for (dim_t i = local_id; i < depth; i += group_size) {
+          row_exp_sum += ::sycl::exp(sycl_backend::to_float(row_scores[i])
+                                     - normalization_max);
+        }
+        scratch[local_id] = row_exp_sum;
+        item.barrier(::sycl::access::fence_space::local_space);
+        for (dim_t stride = group_size / 2; stride > 0; stride >>= 1) {
+          if (local_id < stride)
+            scratch[local_id] += scratch[local_id + stride];
+          item.barrier(::sycl::access::fence_space::local_space);
+        }
+        const float log_denominator = ::sycl::log(scratch[0]);
+        item.barrier(::sycl::access::fence_space::local_space);
+        const auto normalized_score = [=](const DeviceT score) {
+          return round_to_device_precision<DeviceT>(
+            (sycl_backend::to_float(score) - normalization_max)
+            - log_denominator);
+        };
+
+        float text_max = lowest;
+        for (dim_t i = local_id; i < num_text_tokens; i += group_size)
+          text_max = ::sycl::fmax(text_max,
+                                  normalized_score(row_scores[i]));
+        text_max = ::sycl::reduce_over_group(group,
+                                             text_max,
+                                             ::sycl::maximum<float>());
+
+        float timestamp_max = lowest;
+        for (dim_t i = local_id; i < num_timestamp_tokens; i += group_size) {
+          timestamp_max = ::sycl::fmax(
+            timestamp_max,
+            normalized_score(row_scores[timestamp_begin + i]));
+        }
+        timestamp_max = ::sycl::reduce_over_group(group,
+                                                  timestamp_max,
+                                                  ::sycl::maximum<float>());
+
+        float timestamp_exp_sum = 0;
+        for (dim_t i = local_id; i < num_timestamp_tokens; i += group_size) {
+          timestamp_exp_sum += ::sycl::exp(
+            normalized_score(row_scores[timestamp_begin + i]) - timestamp_max);
+        }
+        scratch[local_id] = timestamp_exp_sum;
+        item.barrier(::sycl::access::fence_space::local_space);
+        for (dim_t stride = group_size / 2; stride > 0; stride >>= 1) {
+          if (local_id < stride)
+            scratch[local_id] += scratch[local_id + stride];
+          item.barrier(::sycl::access::fence_space::local_space);
+        }
+        timestamp_exp_sum = scratch[0];
+
+        if (::sycl::log(timestamp_exp_sum) + timestamp_max > text_max) {
+          auto* row_logits = device_logits + row * depth;
+          for (dim_t i = local_id; i < num_text_tokens; i += group_size)
+            row_logits[i] = device_disable_value;
+        }
+        });
+    });
+  }
+
+  template <>
+  template <typename T>
   void primitives<Device::SYCL>::exp(const T* input, T* output, const dim_t size) {
     floating_transform(input, output, size, [](float value) { return ::sycl::exp(value); });
   }
@@ -1285,11 +1509,20 @@ namespace ctranslate2 {
   template void primitives<Device::SYCL>::exp(const T*, T*, dim_t);      \
   template void primitives<Device::SYCL>::log(const T*, T*, dim_t);
 
+#define DECLARE_WHISPER_TIMESTAMP_IMPL(T)                                \
+  template void primitives<Device::SYCL>::suppress_text_if_timestamp(    \
+    T*, const T*, dim_t, dim_t, dim_t, dim_t, dim_t, uint64_t, T);
+
   DECLARE_FLOAT_IMPL(float)
   DECLARE_FLOAT_IMPL(float16_t)
   DECLARE_FLOAT_IMPL(bfloat16_t)
 
+  DECLARE_WHISPER_TIMESTAMP_IMPL(float)
+  DECLARE_WHISPER_TIMESTAMP_IMPL(float16_t)
+  DECLARE_WHISPER_TIMESTAMP_IMPL(bfloat16_t)
+
 #undef DECLARE_FLOAT_IMPL
+#undef DECLARE_WHISPER_TIMESTAMP_IMPL
 
 }
 

@@ -1,5 +1,8 @@
 #include "ctranslate2/layers/transformer.h"
 
+#include "ctranslate2/decoding_utils.h"
+#include "layers/decoder_cache.h"
+
 #include <cmath>
 
 namespace ctranslate2 {
@@ -559,7 +562,8 @@ namespace ctranslate2 {
 
     bool TransformerDecoder::replicate_state(const std::string& name) const {
       // No need to replicate projected memory keys and values as they are the same for each beam.
-      return !_with_encoder_attention || !starts_with(name, "memory");
+      return name != detail::deferred_self_cache_indices_name
+        && (!_with_encoder_attention || !starts_with(name, "memory"));
     }
 
     void TransformerDecoder::set_alignment_heads(const dim_t layer,
@@ -730,6 +734,19 @@ namespace ctranslate2 {
 
       StorageView position_bias(dtype, device);
 
+      const auto deferred_cache_it
+        = state.find(detail::deferred_self_cache_indices_name);
+      StorageView deferred_cache_indices_on_device(DataType::INT32, device);
+      const StorageView* deferred_self_cache_indices = nullptr;
+      if (deferred_cache_it != state.end()) {
+        if (deferred_cache_it->second.device() == device) {
+          deferred_self_cache_indices = &deferred_cache_it->second;
+        } else {
+          deferred_cache_indices_on_device = deferred_cache_it->second.to(device);
+          deferred_self_cache_indices = &deferred_cache_indices_on_device;
+        }
+      }
+
       std::vector<StorageView> layer_ins;
 
       while (true) {
@@ -791,6 +808,8 @@ namespace ctranslate2 {
             input_lengths_mask = std::make_unique<StorageView>(std::move(tmp_lengths));
           }
 
+          const detail::ScopedSelfCacheIndices cache_indices_scope(
+            step >= 0 && i == 0 ? deferred_self_cache_indices : nullptr);
           (*_layers[l])(*layer_in_chunk,
                         input_lengths_mask.get(),
                         memory,
@@ -815,6 +834,9 @@ namespace ctranslate2 {
         }
         layer_in = std::move(*layer_in_chunk);
       }
+
+      if (step >= 0 && deferred_self_cache_indices)
+        state.erase(detail::deferred_self_cache_indices_name);
 
       if (step == 0) {
         // The memory is no longer needed as its projections were cached in the first step.
@@ -855,7 +877,6 @@ namespace ctranslate2 {
           if (_final_logit_softcapping != 0.f) {
             // logits = tanh(logits / cap) * cap  — squashes logits to (-cap, cap)
             const auto dtype = outputs->dtype();
-            const auto device = outputs->device();
             ops::Mul()(*outputs, StorageView(1.f / _final_logit_softcapping).to(dtype), *outputs);
             ops::Tanh()(*outputs, *outputs);
             ops::Mul()(*outputs, StorageView(_final_logit_softcapping).to(dtype), *outputs);

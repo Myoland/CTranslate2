@@ -3,6 +3,7 @@
 #include <ctranslate2/decoding.h>
 
 #include "test_utils.h"
+#include "layers/decoder_cache.h"
 
 TEST(ModelTest, ContainsModel) {
   ASSERT_TRUE(models::contains_model(default_model_dir()));
@@ -149,3 +150,54 @@ TEST(ModelTest, DecoderIterativeSequence) {
     expect_storage_eq(state_sequence[key], state_by_step[key], 1e-5);
   }
 }
+
+#ifdef CT2_WITH_SYCL
+
+TEST(SYCLModelTest, FullSequencePreservesDeferredIterativeCacheMapping) {
+  if (get_device_count(Device::SYCL) == 0)
+    GTEST_SKIP() << "No compatible Intel Level Zero device is visible";
+
+  auto model = models::Model::load(default_model_dir(),
+                                   Device::SYCL,
+                                   /*device_index=*/0,
+                                   ComputeType::FLOAT32)
+                 ->as_sequence_to_sequence();
+  auto& encoder_decoder = dynamic_cast<models::EncoderDecoderReplica&>(*model);
+  auto& encoder = encoder_decoder.encoder();
+  auto& decoder = encoder_decoder.decoder();
+
+  const StorageView source_ids(
+    {1, 6},
+    std::vector<int32_t>{31, 10, 19, 13, 5, 7},
+    Device::SYCL);
+  StorageView memory(encoder.output_type(), Device::SYCL);
+  encoder(source_ids, memory);
+
+  layers::DecoderState state = decoder.initial_state();
+  state.emplace("memory", memory);
+  const StorageView first_id({1}, std::vector<int32_t>{1}, Device::SYCL);
+  decoder(/*step=*/0, first_id, state);
+
+  const StorageView alive({1}, std::vector<int32_t>{0}, Device::SYCL);
+  decoder.update_state(state, alive);
+  ASSERT_NE(state.find(layers::detail::deferred_self_cache_indices_name),
+            state.end());
+
+  // A full-sequence scoring call does not consume iterative self-attention
+  // caches, so it must also leave their deferred logical mapping intact.
+  state.emplace("memory", memory);
+  const StorageView sequence_ids(
+    {1, 2}, std::vector<int32_t>{1, 3}, Device::SYCL);
+  const StorageView lengths({1}, std::vector<int32_t>{2}, Device::SYCL);
+  StorageView sequence_logits(decoder.output_type(), Device::SYCL);
+  decoder(sequence_ids, lengths, state, sequence_logits);
+  ASSERT_NE(state.find(layers::detail::deferred_self_cache_indices_name),
+            state.end());
+
+  const StorageView second_id({1}, std::vector<int32_t>{3}, Device::SYCL);
+  decoder(/*step=*/1, second_id, state);
+  EXPECT_EQ(state.find(layers::detail::deferred_self_cache_indices_name),
+            state.end());
+}
+
+#endif

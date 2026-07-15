@@ -7,6 +7,7 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/googletest ${CMAKE_C
 add_executable(ctranslate2_test
   attention_test.cc
   batching_test.cc
+  cache_gather_append_test.cc
   decoding_test.cc
   layers_test.cc
   model_test.cc
@@ -16,6 +17,12 @@ add_executable(ctranslate2_test
   translator_test.cc
   test_utils.cc
   test.cc)
+if(WITH_SYCL)
+  target_sources(ctranslate2_test PRIVATE
+    sycl_fused_attention_test.cc
+    sycl_fused_qkv_projection_test.cc)
+  target_link_options(ctranslate2_test PRIVATE ${SYCL_LINK_OPTIONS})
+endif()
 target_include_directories(ctranslate2_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../src
   )

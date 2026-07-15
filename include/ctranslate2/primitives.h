@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "ctranslate2/devices.h"
 #include "ctranslate2/types.h"
 
@@ -167,6 +169,21 @@ namespace ctranslate2 {
 
     template <typename T>
     static float logsumexp(const T* x, dim_t size);
+
+    // Applies the Whisper timestamp probability rule to the selected rows,
+    // including the output-type rounding of LogSoftMax. The rows to process
+    // are encoded in check_rows, which supports up to 64 rows. This primitive
+    // is currently implemented by the SYCL backend.
+    template <typename T>
+    static void suppress_text_if_timestamp(T* logits,
+                                           const T* scores,
+                                           dim_t rows,
+                                           dim_t depth,
+                                           dim_t num_text_tokens,
+                                           dim_t timestamp_begin,
+                                           dim_t num_timestamp_tokens,
+                                           uint64_t check_rows,
+                                           T disable_value);
 
     template <typename T>
     static void exp(const T* x, T* y, dim_t size);
