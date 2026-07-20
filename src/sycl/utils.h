@@ -5,6 +5,8 @@
 
 #include <sycl/sycl.hpp>
 
+#include "sycl/device_info.h"
+
 namespace ctranslate2 {
   namespace sycl_backend {
 

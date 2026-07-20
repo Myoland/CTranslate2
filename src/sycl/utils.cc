@@ -12,9 +12,62 @@
 
 namespace ctranslate2 {
   namespace sycl_backend {
+
+    IntelGpuModel intel_gpu_model_from_device_id(
+      const uint32_t device_id,
+      const uint32_t execution_units) {
+      switch (device_id) {
+      case 0xe20b:
+        return IntelGpuModel::ArcB580;
+      case 0xb080:
+      case 0xb082:
+      case 0xb084:
+      case 0xb086:
+        return IntelGpuModel::ArcB390;
+      case 0x64a0:
+        // Lunar Lake shares this PCI ID between Arc 130V and 140V. Only the
+        // full 64-vector-engine 140V was measured for these tuned paths.
+        return execution_units >= 64
+                 ? IntelGpuModel::Arc140V
+                 : IntelGpuModel::Other;
+      default:
+        return IntelGpuModel::Other;
+      }
+    }
+
     namespace {
 
       constexpr uint32_t intel_vendor_id = 0x8086;
+
+      IntelGpuModel detect_intel_gpu_model(const ::sycl::device& device) {
+        try {
+          if (device.has(::sycl::aspect::ext_intel_device_id)) {
+            const uint32_t device_id = device.get_info<
+              ::sycl::ext::intel::info::device::device_id>();
+            uint32_t execution_units = 0;
+            if (device.has(::sycl::aspect::ext_intel_gpu_eu_count)) {
+              execution_units = device.get_info<
+                ::sycl::ext::intel::info::device::gpu_eu_count>();
+            }
+            const IntelGpuModel model
+              = intel_gpu_model_from_device_id(device_id, execution_units);
+            if (model != IntelGpuModel::Other)
+              return model;
+          }
+        } catch (const ::sycl::exception&) {
+          // Preserve generic dispatch when an older runtime does not expose
+          // the optional Intel device ID query.
+        }
+
+        // Keep compatibility with runtimes that identified B580 by name
+        // before exposing ext_intel_device_id. B390 names are not stable and
+        // therefore intentionally rely on the exact PCI ID mapping above.
+        const std::string name
+          = device.get_info<::sycl::info::device::name>();
+        return name.find("B580") != std::string::npos
+                 ? IntelGpuModel::ArcB580
+                 : IntelGpuModel::Other;
+      }
 
       class AsyncErrors {
       public:
@@ -88,11 +141,13 @@ namespace ctranslate2 {
       struct DeviceEntry {
         explicit DeviceEntry(::sycl::device selected_device)
           : device(std::move(selected_device))
-          , context(device) {
+          , context(device)
+          , model(detect_intel_gpu_model(device)) {
         }
 
         ::sycl::device device;
         ::sycl::context context;
+        IntelGpuModel model;
       };
 
       class Registry {
@@ -232,6 +287,10 @@ namespace ctranslate2 {
 
     const ::sycl::context& get_context(int device_index) {
       return registry().get(device_index).context;
+    }
+
+    IntelGpuModel get_intel_gpu_model(int device_index) {
+      return registry().get(device_index).model;
     }
 
     ::sycl::queue& get_queue(int device_index) {

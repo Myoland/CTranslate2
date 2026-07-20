@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
-#include <string>
 #include <type_traits>
 
 #include "sycl/ops_utils.h"
@@ -30,15 +29,21 @@ namespace ctranslate2 {
         thread_local Cache cache;
         if (cache.device_index != device_index) {
           const ::sycl::device& device = sycl_backend::get_device(device_index);
-          const std::string name
-            = device.get_info<::sycl::info::device::name>();
+          const sycl_backend::IntelGpuModel model
+            = sycl_backend::get_intel_gpu_model(device_index);
           const auto subgroup_sizes
             = device.get_info<::sycl::info::device::sub_group_sizes>();
           cache.device_index = device_index;
           cache.supported
-            = name.find("B580") != std::string::npos
+            = (model == sycl_backend::IntelGpuModel::ArcB580
+               || model == sycl_backend::IntelGpuModel::ArcB390
+               || model == sycl_backend::IntelGpuModel::Arc140V)
+              && device.has(::sycl::aspect::fp16)
               && device.get_info<::sycl::info::device::max_work_group_size>()
                 >= softmax_work_group_size
+              && device.get_info<
+                   ::sycl::info::device::max_work_item_sizes<1>>()[0]
+                   >= softmax_work_group_size
               && std::find(subgroup_sizes.begin(),
                            subgroup_sizes.end(),
                            softmax_subgroup_size) != subgroup_sizes.end();
@@ -204,7 +209,7 @@ namespace ctranslate2 {
       const size_t wg = sycl_backend::work_group_size();
       const bool log_softmax = _log;
 
-      // The B580 encoder submits many wide FP16 SoftMax rows. Preserve the
+      // Tuned Arc GPUs submit many wide FP16 SoftMax rows. Preserve the
       // original binary reduction tree, but finish its last 32 lanes with
       // subgroup shuffles. Cache the FP32 exponentials in local memory so the
       // normalization pass neither reloads the input nor evaluates exp again.

@@ -5,6 +5,7 @@
 
 #include "ctranslate2/ops/bias_add.h"
 #include "ctranslate2/ops/gemm.h"
+#include "sycl/device_info.h"
 #include "sycl/fused_qkv_projection.h"
 
 namespace {
@@ -22,6 +23,49 @@ namespace {
       {rows, input_size, output_size});
   }
 
+}
+
+TEST(IntelGpuModelTest, ClassifiesTunedArcProductsByDeviceId) {
+  EXPECT_EQ(sycl_backend::intel_gpu_model_from_device_id(0xe20b),
+            sycl_backend::IntelGpuModel::ArcB580);
+  for (const uint32_t device_id : {0xb080, 0xb082, 0xb084, 0xb086}) {
+    EXPECT_EQ(sycl_backend::intel_gpu_model_from_device_id(device_id),
+              sycl_backend::IntelGpuModel::ArcB390);
+  }
+
+  EXPECT_EQ(sycl_backend::intel_gpu_model_from_device_id(0xb081),
+            sycl_backend::IntelGpuModel::Other);
+  EXPECT_EQ(sycl_backend::intel_gpu_model_from_device_id(0x64a0, 64),
+            sycl_backend::IntelGpuModel::Arc140V);
+  EXPECT_EQ(sycl_backend::intel_gpu_model_from_device_id(0x64a0, 56),
+            sycl_backend::IntelGpuModel::Other);
+  EXPECT_EQ(sycl_backend::intel_gpu_model_from_device_id(0x64a0),
+            sycl_backend::IntelGpuModel::Other);
+  for (const uint32_t device_id : {0x6420, 0x64b0, 0x64a1}) {
+    EXPECT_EQ(sycl_backend::intel_gpu_model_from_device_id(device_id, 64),
+              sycl_backend::IntelGpuModel::Other);
+  }
+  EXPECT_EQ(sycl_backend::intel_gpu_model_from_device_id(0x7d55),
+            sycl_backend::IntelGpuModel::Other);
+}
+
+TEST(FusedQKVProjectionPolicyTest, UsesProductSpecificRowBoundaries) {
+  using sycl_backend::IntelGpuModel;
+  using sycl_backend::is_fused_qkv_projection_profitable;
+
+  EXPECT_TRUE(is_fused_qkv_projection_profitable(IntelGpuModel::ArcB580, 1));
+  EXPECT_TRUE(is_fused_qkv_projection_profitable(IntelGpuModel::ArcB580, 80));
+  EXPECT_FALSE(is_fused_qkv_projection_profitable(IntelGpuModel::ArcB580, 81));
+
+  EXPECT_FALSE(is_fused_qkv_projection_profitable(IntelGpuModel::ArcB390, 4));
+  EXPECT_TRUE(is_fused_qkv_projection_profitable(IntelGpuModel::ArcB390, 5));
+  EXPECT_TRUE(is_fused_qkv_projection_profitable(IntelGpuModel::ArcB390, 20));
+  EXPECT_FALSE(is_fused_qkv_projection_profitable(IntelGpuModel::ArcB390, 21));
+
+  EXPECT_TRUE(is_fused_qkv_projection_profitable(IntelGpuModel::Arc140V, 1));
+  EXPECT_TRUE(is_fused_qkv_projection_profitable(IntelGpuModel::Arc140V, 20));
+  EXPECT_FALSE(is_fused_qkv_projection_profitable(IntelGpuModel::Arc140V, 21));
+  EXPECT_FALSE(is_fused_qkv_projection_profitable(IntelGpuModel::Other, 5));
 }
 
 TEST(SYCLFusedQKVProjectionTest, DispatchPredicateIsStrict) {
@@ -49,15 +93,19 @@ TEST(SYCLFusedQKVProjectionTest, DispatchPredicateIsStrict) {
   if (!exact_shape_supported)
     GTEST_SKIP() << "The exact-shape kernel is intentionally disabled on this device";
 
+  const sycl_backend::IntelGpuModel model
+    = sycl_backend::get_intel_gpu_model();
   for (const dim_t supported_rows : {1, 5, 10, 16, 20, 35, 40, 64, 80}) {
     config.rows = supported_rows;
-    EXPECT_TRUE(sycl_backend::supports_fused_qkv_projection_fp16(config));
+    EXPECT_EQ(sycl_backend::supports_fused_qkv_projection_fp16(config),
+              sycl_backend::is_fused_qkv_projection_profitable(
+                model, supported_rows));
   }
 }
 
 TEST(SYCLFusedQKVProjectionTest, MatchesOneMKLBiasAndSplit) {
   if (!can_test_fused_qkv())
-    GTEST_SKIP() << "The specialized B580 FP16 matrix shape is unavailable";
+    GTEST_SKIP() << "The specialized Arc FP16 matrix shape is unavailable";
 
   std::mt19937 generator(123);
   std::uniform_real_distribution<float> value_distribution(-0.05f, 0.05f);
@@ -75,9 +123,19 @@ TEST(SYCLFusedQKVProjectionTest, MatchesOneMKLBiasAndSplit) {
   const StorageView bias
     = StorageView({output_size}, bias_values)
         .to(DataType::FLOAT16).to(Device::SYCL);
+  const sycl_backend::IntelGpuModel model
+    = sycl_backend::get_intel_gpu_model();
+  const float tolerance
+    = (model == sycl_backend::IntelGpuModel::ArcB390
+       || model == sycl_backend::IntelGpuModel::Arc140V)
+        ? 2e-4f
+        : 5e-4f;
 
   for (const dim_t test_rows : {1, 5, 10, 16, 17, 20, 35, 40, 64, 80}) {
     SCOPED_TRACE(test_rows);
+    if (!sycl_backend::supports_fused_qkv_projection_fp16(
+          {test_rows, input_size, output_size}))
+      continue;
     std::vector<float> input_values(test_rows * input_size);
     for (float& value : input_values)
       value = value_distribution(generator);
@@ -100,8 +158,8 @@ TEST(SYCLFusedQKVProjectionTest, MatchesOneMKLBiasAndSplit) {
     ASSERT_TRUE(sycl_backend::fused_qkv_projection_fp16(
       input, weight, bias, output1, output2, output3));
 
-    expect_storage_eq(output1.to_float32(), expected1.to_float32(), 5e-4f);
-    expect_storage_eq(output2.to_float32(), expected2.to_float32(), 5e-4f);
-    expect_storage_eq(output3.to_float32(), expected3.to_float32(), 5e-4f);
+    expect_storage_eq(output1.to_float32(), expected1.to_float32(), tolerance);
+    expect_storage_eq(output2.to_float32(), expected2.to_float32(), tolerance);
+    expect_storage_eq(output3.to_float32(), expected3.to_float32(), tolerance);
   }
 }

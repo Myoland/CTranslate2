@@ -3,7 +3,6 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
-#include <string>
 
 #include "sycl/helpers.h"
 
@@ -27,61 +26,51 @@ namespace ctranslate2 {
                + attention_work_group_size * sizeof(float);
       }
 
-      // oneMKL amortizes its launch cost as either the decoder row count or
-      // cache length grows. These piecewise limits keep this scalar fused
-      // kernel only where B580 microbenchmarks show a useful win.
-      bool is_fused_attention_profitable(const dim_t batch_size,
-                                         const dim_t key_length) {
-        if (batch_size <= 5)
-          return key_length <= 320;
-        if (batch_size <= 10)
-          return key_length <= 128;
-        if (batch_size <= 20)
-          return key_length <= 64;
-        return key_length <= 16;
-      }
-
-      bool device_supports_batched_fused_attention() {
+      bool device_supports_fused_attention(const int device_index,
+                                           const dim_t key_length) {
         struct Cache {
           int device_index = -2;
           bool supported = false;
+          size_t local_memory_size = 0;
         };
         thread_local Cache cache;
-        const int device_index = get_device_index();
         if (cache.device_index != device_index) {
-          const std::string name
-            = get_device(device_index).get_info<::sycl::info::device::name>();
+          const ::sycl::device& device = get_device(device_index);
+          const bool supported
+            = device.has(::sycl::aspect::fp16)
+              && device.get_info<::sycl::info::device::max_work_group_size>()
+                   >= attention_work_group_size
+              && device.get_info<
+                   ::sycl::info::device::max_work_item_sizes<1>>()[0]
+                   >= attention_work_group_size;
+          const size_t local_memory_size
+            = device.get_info<::sycl::info::device::local_mem_size>();
           cache.device_index = device_index;
-          cache.supported = name.find("B580") != std::string::npos;
+          cache.supported = supported;
+          cache.local_memory_size = local_memory_size;
         }
-        return cache.supported;
+        return cache.supported
+               && required_local_memory(key_length) <= cache.local_memory_size;
       }
 
       bool can_run_fused_single_query_attention_fp16(const dim_t batch_size,
                                                      const dim_t num_heads,
                                                      const dim_t key_length,
                                                      const dim_t head_dim) {
+        const int device_index = get_device_index();
+        const IntelGpuModel model = get_intel_gpu_model(device_index);
         if (batch_size <= 0
             || batch_size > maximum_attention_batch_size
             || num_heads != attention_num_heads
             || key_length <= 0
             || key_length > maximum_profitable_key_length
             || head_dim != attention_head_dim
-            || !is_fused_attention_profitable(batch_size, key_length))
+            || !is_fused_attention_profitable(model,
+                                              batch_size,
+                                              key_length))
           return false;
 
-        // Preserve the original exact beam-5 dispatch on other SYCL GPUs.
-        // The expanded row/key profitability table was measured on B580.
-        if (batch_size != original_attention_batch_size
-            && !device_supports_batched_fused_attention())
-          return false;
-
-        const ::sycl::device& device = get_device();
-        if (!device.has(::sycl::aspect::fp16)
-            || device.get_info<::sycl::info::device::max_work_group_size>()
-                 < attention_work_group_size
-            || required_local_memory(key_length)
-                 > device.get_info<::sycl::info::device::local_mem_size>())
+        if (!device_supports_fused_attention(device_index, key_length))
           return false;
 
         // Every work-group owns one independent [batch, head] row. Keep the
@@ -104,6 +93,57 @@ namespace ctranslate2 {
 
       class FusedSingleQueryAttentionFP16Kernel;
 
+    }
+
+    bool is_fused_attention_profitable(const IntelGpuModel model,
+                                       const dim_t batch_size,
+                                       const dim_t key_length) {
+      if (batch_size <= 0
+          || batch_size > maximum_attention_batch_size
+          || key_length <= 0
+          || key_length > maximum_profitable_key_length)
+        return false;
+
+      if (model == IntelGpuModel::ArcB580) {
+        if (batch_size <= 5)
+          return key_length <= 320;
+        if (batch_size <= 10)
+          return key_length <= 128;
+        if (batch_size <= 20)
+          return key_length <= 64;
+        return key_length <= 16;
+      }
+
+      if (model == IntelGpuModel::ArcB390) {
+        // B390's oneMKL crossover happens much earlier than B580's. The
+        // scalar fused kernel remains useful for short decoder caches, with
+        // one repeatable 16-token window at 20 flattened beam rows.
+        if (batch_size <= 4)
+          return key_length <= 64;
+        if (batch_size == original_attention_batch_size)
+          return key_length <= 96;
+        if (batch_size == 20)
+          return key_length <= 16;
+        return batch_size <= maximum_attention_batch_size
+               && key_length <= 8;
+      }
+
+      if (model == IntelGpuModel::Arc140V) {
+        // Measured Lunar Lake crossovers. Rows are flattened decoder batches
+        // including the beam dimension, so typical Whisper batches 1/2/4/8
+        // arrive here as 5/10/20/40 rows.
+        if (batch_size <= 2)
+          return key_length <= 64;
+        if (batch_size <= 16)
+          return key_length <= 32;
+        if (batch_size <= 48)
+          return key_length <= 16;
+        return key_length <= 8;
+      }
+
+      // Preserve the original beam-5 dispatch on untuned SYCL products.
+      return batch_size == original_attention_batch_size
+             && key_length <= maximum_profitable_key_length;
     }
 
     bool supports_fused_single_query_attention_fp16(

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ctranslate2/types.h"
+#include "sycl/device_info.h"
 
 namespace ctranslate2 {
   namespace sycl_backend {
@@ -17,15 +18,22 @@ namespace ctranslate2 {
       bool has_alibi = false;
     };
 
+    // Returns the measured product-specific profitability decision without
+    // querying a device. Decoder batches and beams are flattened into rows.
+    bool is_fused_attention_profitable(IntelGpuModel model,
+                                       dim_t batch_size,
+                                       dim_t key_length);
+
     // Returns whether the selected SYCL device can run the specialized
     // single-query attention kernel for this shape.  Inputs use the contiguous
     // [batch, heads, length, 64] layout and each batch has its own K/V cache.
-    // On B580, the predicate includes the measured profitability boundary: up
-    // to 64 independent Whisper decoder rows with a row-dependent key-length
-    // limit. Other SYCL GPUs retain the original exact beam-5 dispatch. All
-    // accepted shapes use 20 heads and no attention features requiring extra
-    // outputs or score modifications. Decoder batches and beams are flattened
-    // into these rows; the kernel does not share state between them.
+    // On tuned Arc products, the predicate includes a product-specific
+    // profitability boundary: up to 64 independent Whisper decoder rows with
+    // a row-dependent key-length limit. Other SYCL GPUs retain the original
+    // exact beam-5 dispatch. All accepted shapes use 20 heads and no attention
+    // features requiring extra outputs or score modifications. Decoder batches
+    // and beams are flattened into these rows; the kernel does not share state
+    // between them.
     bool supports_fused_single_query_attention_fp16(
       const FusedSingleQueryAttentionFP16Config& config);
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ctranslate2/storage_view.h"
+#include "sycl/device_info.h"
 
 namespace ctranslate2 {
   namespace sycl_backend {
@@ -11,10 +12,14 @@ namespace ctranslate2 {
       dim_t output_size;
     };
 
-    // This predicate is intentionally narrow: the kernel relies on the B580
-    // 16x16 FP16 accumulator lane layout and is only enabled for up to 80 rows
-    // of Whisper's iterative self-attention projection. This is the measured
-    // B580 profitability boundary and covers batch 16 with beam size 5.
+    // Returns whether the specialized projection is profitable for a product
+    // and row count. This helper is independent of the selected device so the
+    // measured dispatch boundaries can be tested without GPU hardware.
+    bool is_fused_qkv_projection_profitable(IntelGpuModel model, dim_t rows);
+
+    // This predicate is intentionally narrow: the kernel relies on a 16x16
+    // FP16 matrix layout and uses independently measured B580, B390, and
+    // Arc 140V row boundaries for Whisper's iterative self-attention projection.
     bool supports_fused_qkv_projection_fp16(
       const FusedQKVProjectionFP16Config& config,
       int device_index = -1);

@@ -81,39 +81,104 @@ namespace {
 
 }
 
+TEST(FusedAttentionPolicyTest, UsesProductSpecificKeyBoundaries) {
+  using sycl_backend::IntelGpuModel;
+  using sycl_backend::is_fused_attention_profitable;
+
+  EXPECT_TRUE(is_fused_attention_profitable(IntelGpuModel::ArcB580, 5, 320));
+  EXPECT_TRUE(is_fused_attention_profitable(IntelGpuModel::ArcB580, 10, 128));
+  EXPECT_TRUE(is_fused_attention_profitable(IntelGpuModel::ArcB580, 20, 64));
+  EXPECT_TRUE(is_fused_attention_profitable(IntelGpuModel::ArcB580, 64, 16));
+  EXPECT_FALSE(is_fused_attention_profitable(IntelGpuModel::ArcB580, 64, 17));
+
+  EXPECT_TRUE(is_fused_attention_profitable(IntelGpuModel::ArcB390, 1, 64));
+  EXPECT_FALSE(is_fused_attention_profitable(IntelGpuModel::ArcB390, 1, 65));
+  EXPECT_TRUE(is_fused_attention_profitable(IntelGpuModel::ArcB390, 5, 96));
+  EXPECT_FALSE(is_fused_attention_profitable(IntelGpuModel::ArcB390, 5, 97));
+  EXPECT_TRUE(is_fused_attention_profitable(IntelGpuModel::ArcB390, 10, 8));
+  EXPECT_FALSE(is_fused_attention_profitable(IntelGpuModel::ArcB390, 10, 9));
+  EXPECT_TRUE(is_fused_attention_profitable(IntelGpuModel::ArcB390, 20, 16));
+  EXPECT_FALSE(is_fused_attention_profitable(IntelGpuModel::ArcB390, 20, 17));
+  EXPECT_TRUE(is_fused_attention_profitable(IntelGpuModel::ArcB390, 64, 8));
+  EXPECT_FALSE(is_fused_attention_profitable(IntelGpuModel::ArcB390, 64, 9));
+
+  EXPECT_TRUE(is_fused_attention_profitable(IntelGpuModel::Arc140V, 2, 64));
+  EXPECT_FALSE(is_fused_attention_profitable(IntelGpuModel::Arc140V, 2, 65));
+  EXPECT_TRUE(is_fused_attention_profitable(IntelGpuModel::Arc140V, 16, 32));
+  EXPECT_FALSE(is_fused_attention_profitable(IntelGpuModel::Arc140V, 16, 33));
+  EXPECT_TRUE(is_fused_attention_profitable(IntelGpuModel::Arc140V, 48, 16));
+  EXPECT_FALSE(is_fused_attention_profitable(IntelGpuModel::Arc140V, 48, 17));
+  EXPECT_TRUE(is_fused_attention_profitable(IntelGpuModel::Arc140V, 64, 8));
+  EXPECT_FALSE(is_fused_attention_profitable(IntelGpuModel::Arc140V, 64, 9));
+
+  EXPECT_TRUE(is_fused_attention_profitable(IntelGpuModel::Other, 5, 320));
+  EXPECT_FALSE(is_fused_attention_profitable(IntelGpuModel::Other, 5, 321));
+  EXPECT_FALSE(is_fused_attention_profitable(IntelGpuModel::Other, 10, 8));
+}
+
 TEST(SYCLFusedAttentionTest, MatchesUnfusedPathAtK32) {
+  if (!supports_fused_attention(default_batch_size, 32))
+    GTEST_SKIP() << "The default fused-attention shape is unavailable";
   test_fused_attention(default_batch_size, 32);
-  if (!supports_fused_attention(1, 32))
-    GTEST_SKIP() << "The expanded batched kernel is B580-specific";
-  for (const dim_t batch_size : {1, 10, 20})
-    test_fused_attention(batch_size, 32);
+  for (const dim_t batch_size : {1, 10, 20}) {
+    if (supports_fused_attention(batch_size, 32))
+      test_fused_attention(batch_size, 32);
+  }
+}
+
+TEST(SYCLFusedAttentionTest, MatchesProductSpecificBoundaries) {
+  if (get_device_count(Device::SYCL) == 0
+      || !mayiuse_float16(Device::SYCL))
+    GTEST_SKIP() << "No FP16-capable SYCL device is available";
+
+  bool tested_shape = false;
+  for (const auto [batch_size, key_length]
+       : std::vector<std::pair<dim_t, dim_t>>{
+           {1, 64}, {5, 96}, {10, 8}, {10, 32}, {16, 32},
+           {20, 16}, {48, 16}, {64, 8}}) {
+    if (supports_fused_attention(batch_size, key_length)) {
+      test_fused_attention(batch_size, key_length);
+      tested_shape = true;
+    }
+  }
+  if (!tested_shape)
+    GTEST_SKIP() << "No product-specific fused-attention boundary is available";
 }
 
 TEST(SYCLFusedAttentionTest, MatchesUnfusedPathAtK64) {
   if (!supports_fused_attention(11, 64))
-    GTEST_SKIP() << "The expanded batched kernel is B580-specific";
+    GTEST_SKIP() << "The expanded batched kernel is unavailable";
   for (const dim_t batch_size : {11, 20})
     test_fused_attention(batch_size, 64);
 }
 
 TEST(SYCLFusedAttentionTest, MatchesUnfusedPathAtK16) {
-  if (!supports_fused_attention(40, 16))
-    GTEST_SKIP() << "The expanded batched kernel is B580-specific";
-  for (const dim_t batch_size : {40, 64})
-    test_fused_attention(batch_size, 16);
+  bool tested_shape = false;
+  for (const dim_t batch_size : {40, 64}) {
+    if (supports_fused_attention(batch_size, 16)) {
+      test_fused_attention(batch_size, 16);
+      tested_shape = true;
+    }
+  }
+  if (!tested_shape)
+    GTEST_SKIP() << "The expanded batched kernel is unavailable";
 }
 
 TEST(SYCLFusedAttentionTest, MatchesUnfusedPathAtK128) {
+  if (!supports_fused_attention(default_batch_size, 128))
+    GTEST_SKIP() << "The fused-attention shape is outside this product's boundary";
   test_fused_attention(default_batch_size, 128);
 }
 
 TEST(SYCLFusedAttentionTest, MatchesBatchedUnfusedPathAtK128) {
   if (!supports_fused_attention(10, 128))
-    GTEST_SKIP() << "The expanded batched kernel is B580-specific";
+    GTEST_SKIP() << "The expanded batched kernel is unavailable";
   test_fused_attention(10, 128);
 }
 
 TEST(SYCLFusedAttentionTest, MatchesUnfusedPathAtK320) {
+  if (!supports_fused_attention(default_batch_size, 320))
+    GTEST_SKIP() << "The fused-attention shape is outside this product's boundary";
   test_fused_attention(default_batch_size, 320);
 }
 
@@ -124,35 +189,30 @@ TEST(SYCLFusedAttentionTest, DispatchPredicateIsStrict) {
 
   sycl_backend::FusedSingleQueryAttentionFP16Config config{
     default_batch_size, num_heads, 1, 16, head_dim};
-  EXPECT_TRUE(sycl_backend::supports_fused_single_query_attention_fp16(config));
+  if (!sycl_backend::supports_fused_single_query_attention_fp16(config))
+    GTEST_SKIP() << "The base fused-attention shape is unavailable";
 
-  config.batch_size = 6;
-  const bool supports_batched
-    = sycl_backend::supports_fused_single_query_attention_fp16(config);
-  for (const dim_t batch_size : {1, 6, 10, 20, 40, 64}) {
+  const sycl_backend::IntelGpuModel model
+    = sycl_backend::get_intel_gpu_model();
+  for (const auto [batch_size, key_length]
+       : std::vector<std::pair<dim_t, dim_t>>{
+           {1, 8}, {1, 64}, {5, 96}, {5, 320}, {6, 8}, {10, 9},
+           {20, 16}, {20, 17}, {40, 8}, {40, 16}, {64, 8}, {64, 16}}) {
     config.batch_size = batch_size;
+    config.key_length = key_length;
     EXPECT_EQ(sycl_backend::supports_fused_single_query_attention_fp16(config),
-              supports_batched);
+              sycl_backend::is_fused_attention_profitable(
+                model, batch_size, key_length));
   }
+
   config.batch_size = 65;
   EXPECT_FALSE(sycl_backend::supports_fused_single_query_attention_fp16(config));
 
-  if (supports_batched) {
-    for (const auto [batch_size, maximum_key_length]
-         : std::vector<std::pair<dim_t, dim_t>>{
-             {6, 128}, {10, 128}, {11, 64}, {20, 64},
-             {21, 16}, {64, 16}}) {
-      config.batch_size = batch_size;
-      config.key_length = maximum_key_length;
-      EXPECT_TRUE(sycl_backend::supports_fused_single_query_attention_fp16(config));
-      ++config.key_length;
-      EXPECT_FALSE(sycl_backend::supports_fused_single_query_attention_fp16(config));
-    }
-  }
-
   config.batch_size = default_batch_size;
   config.key_length = 320;
-  EXPECT_TRUE(sycl_backend::supports_fused_single_query_attention_fp16(config));
+  EXPECT_EQ(sycl_backend::supports_fused_single_query_attention_fp16(config),
+            sycl_backend::is_fused_attention_profitable(
+              model, default_batch_size, 320));
 
   config.key_length = 321;
   EXPECT_FALSE(sycl_backend::supports_fused_single_query_attention_fp16(config));
